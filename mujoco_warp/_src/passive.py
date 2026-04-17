@@ -179,7 +179,7 @@ def _spring_damper_dof_passive(
       qfrc_damper_out[worldid, dofid] = -damping * qvel_in[worldid, dofid]
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _spring_damper_tendon_passive(
   # Model:
   ten_J_rownnz: wp.array[int],
@@ -243,7 +243,7 @@ def _spring_damper_tendon_passive(
     wp.atomic_add(qfrc_damper_out[worldid], dofid, J * frc_damper)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _gravity_force(
   # Model:
   opt_gravity: wp.array[wp.vec3],
@@ -563,7 +563,7 @@ def _qfrc_passive(
   qfrc_passive_out[worldid, dofid] = qfrc_passive
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _flex_elasticity(
   # Model:
   nflex: int,
@@ -661,7 +661,7 @@ def _flex_elasticity(
       wp.atomic_add(qfrc_spring_out, worldid, body_dofadr[bodyid] + x, force[v, x])
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _flex_bending(
   # Model:
   nflex: int,

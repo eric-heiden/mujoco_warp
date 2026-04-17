@@ -1535,7 +1535,7 @@ def _joint_actuator_force(
   return qfrc_actuator_in[worldid, jnt_dofadr[objid]]
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _tendon_actuator_force(
   # Model:
   actuator_trntype: wp.array[int],
@@ -1997,7 +1997,7 @@ def _sensor_acc(
     _write_vector(sensor_type, sensor_datatype, sensor_adr, sensor_cutoff, sensorid, 3, vec3, out)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _sensor_touch(
   # Model:
   opt_cone: int,
@@ -2081,7 +2081,7 @@ def _transform_spatial(vec: wp.spatial_vector, dif: wp.vec3) -> wp.vec3:
   return wp.spatial_bottom(vec) - wp.cross(dif, wp.spatial_top(vec))
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _preprocess_tactile_contacts(
   # Model:
   body_weldid: wp.array[int],
@@ -2118,7 +2118,7 @@ def _preprocess_tactile_contacts(
       weld_geom_list_out[worldid, weld, idx] = geom
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _sensor_tactile(
   # Model:
   body_rootid: wp.array[int],
@@ -2271,7 +2271,7 @@ def _check_match(body_parentid: wp.array[int], body: int, geom: int, objtype: in
   return False
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _contact_match(
   # Model:
   opt_cone: int,
@@ -2706,7 +2706,7 @@ def _energy_pos_zero(
   energy_out[worldid][0] = 0.0
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _energy_pos_gravity(
   # Model:
   opt_gravity: wp.array[wp.vec3],
@@ -2728,7 +2728,7 @@ def _energy_pos_gravity(
   wp.atomic_sub(energy_out, worldid, energy)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _energy_pos_passive_joint(
   # Model:
   qpos_spring: wp.array2d[float],
@@ -2814,7 +2814,7 @@ def _energy_pos_passive_joint(
     wp.atomic_add(energy_out, worldid, energy)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _energy_pos_passive_tendon(
   # Model:
   tendon_stiffness: wp.array2d[float],

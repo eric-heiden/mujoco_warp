@@ -22,7 +22,7 @@ from mujoco_warp._src.types import ObjType
 from mujoco_warp._src.warp_util import event_scope
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _tree_edges(
   # Model:
   nv: int,

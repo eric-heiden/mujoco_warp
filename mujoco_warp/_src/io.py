@@ -1713,7 +1713,7 @@ def _init_subtreemass(
   body_subtreemass_out[body_subtreemass_id, bodyid] = body_mass_in[body_mass_id, bodyid]
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _accumulate_subtreemass(
   body_parentid: wp.array[int],
   body_subtreemass_io: wp.array2d[float],

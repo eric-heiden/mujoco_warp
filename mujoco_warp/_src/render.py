@@ -527,7 +527,7 @@ def render(m: Model, d: Data, rc: RenderContext):
   rc.depth_data.fill_(0.0)
   rc.seg_data.fill_(-1)
 
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def _render_megakernel(
     # Model:
     geom_type: wp.array[int],

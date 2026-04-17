@@ -257,7 +257,7 @@ def _collide_geom_triangle(
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _flex_plane_narrowphase(
   # Model:
   ngeom: int,
@@ -377,7 +377,7 @@ def _flex_plane_narrowphase(
       )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _flex_narrowphase_dim2(
   # Model:
   ngeom: int,
@@ -528,7 +528,7 @@ def _flex_narrowphase_dim2(
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _flex_narrowphase_dim3(
   # Model:
   ngeom: int,

@@ -171,7 +171,7 @@ def mul_m(
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _apply_ft(
   # Model:
   nbody: int,

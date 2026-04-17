@@ -473,7 +473,7 @@ def _subtree_com_init(
   subtree_com_out[worldid, bodyid] = xipos_in[worldid, bodyid] * body_mass[worldid % body_mass.shape[0], bodyid]
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _subtree_com_acc(
   # Model:
   body_parentid: wp.array[int],
@@ -507,7 +507,7 @@ def _subtree_div(
     subtree_com_out[worldid, bodyid] = com / mass
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _cinert(
   # Model:
   body_rootid: wp.array[int],
@@ -803,7 +803,7 @@ def camlight(m: Model, d: Data):
   )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _crb_accumulate(
   # Model:
   body_parentid: wp.array[int],
@@ -822,7 +822,7 @@ def _crb_accumulate(
   wp.atomic_add(crb_out, worldid, pid, crb_in[worldid, bodyid])
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _qM_sparse(
   # Model:
   dof_bodyid: wp.array[int],
@@ -852,7 +852,7 @@ def _qM_sparse(
     dofid = dof_parentid[dofid]
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _qM_dense(
   # Model:
   dof_bodyid: wp.array[int],
@@ -912,7 +912,7 @@ def crb(m: Model, d: Data):
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _tendon_armature(
   # Model:
   dof_parentid: wp.array[int],
@@ -1013,7 +1013,7 @@ def _copy_CSR(
   L_out[worldid, 0, ind] = M_in[worldid, 0, mapM2M[ind]]
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _qLD_acc(
   # Model:
   M_rownnz: wp.array[int],
@@ -1215,7 +1215,7 @@ def _rne_cfrc(m: Model, d: Data, flg_cfrc_ext: bool = False):
   )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _cfrc_backward(
   # Model:
   body_parentid: wp.array[int],
@@ -1295,7 +1295,7 @@ def _cfrc_ext(
     cfrc_ext_out[worldid, bodyid] = support.transform_force(xfrc_applied, subtree_com - xipos)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _count_equality_constraints(
   # Model:
   eq_type: wp.array[int],
@@ -1325,7 +1325,7 @@ def _count_equality_constraints(
     wp.atomic_add(ne_weld_out, worldid, 1)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _cfrc_ext_equality(
   # Model:
   body_rootid: wp.array[int],
@@ -1435,7 +1435,7 @@ def transform_force(force: wp.vec3, torque: wp.vec3, offset: wp.vec3) -> wp.spat
   return wp.spatial_vector(torque, force)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _cfrc_ext_contact(
   # Model:
   opt_cone: int,
@@ -1806,7 +1806,7 @@ def _tendon_dot(
     j += 1
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _tendon_bias_coef(
   # Model:
   ten_J_rownnz: wp.array[int],
@@ -1839,7 +1839,7 @@ def _tendon_bias_coef(
   wp.atomic_add(ten_bias_coef_out[worldid], tenid, ten_Jdot * qvel_in[worldid, dofid])
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _tendon_bias_qfrc(
   # Model:
   ten_J_rownnz: wp.array[int],
@@ -2038,7 +2038,7 @@ def com_vel(m: Model, d: Data):
   )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _transmission(
   # Model:
   nv: int,
@@ -2444,7 +2444,7 @@ def _transmission(
     wp.printf("unhandled transmission type %d\n", trntype)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _transmission_body_moment(
   # Model:
   opt_cone: int,
@@ -2580,7 +2580,7 @@ def _transmission_body_moment(
     wp.atomic_add(actuator_moment_out[worldid], rowadr + colind, wp.dot(normal, jacdif))
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _transmission_body_moment_scale(
   # Model:
   actuator_trntype_body_adr: wp.array[int],
@@ -2701,7 +2701,7 @@ def _solve_LD_sparse_fused(nv: int, nlevels: int):
   def _syncthreads():
     pass
 
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def kernel(
     # In:
     L: wp.array3d[float],
@@ -2928,7 +2928,7 @@ def factor_solve_i(m, d, M, L, D, x, y):
     _factor_solve_i_dense(m, d, M, x, y, L)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _subtree_vel_forward(
   # Model:
   body_rootid: wp.array[int],
@@ -2968,7 +2968,7 @@ def _subtree_vel_forward(
   subtree_bodyvel_out[worldid, bodyid] = wp.spatial_vector(ang, lin)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _linear_momentum(
   # Model:
   body_parentid: wp.array[int],
@@ -2988,7 +2988,7 @@ def _linear_momentum(
   subtree_linvel_out[worldid, bodyid] /= wp.max(MJ_MINVAL, body_subtreemass[worldid % body_subtreemass.shape[0], bodyid])
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _angular_momentum(
   # Model:
   body_parentid: wp.array[int],
@@ -3084,7 +3084,7 @@ def subtree_vel(m: Model, d: Data):
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _joint_tendon(
   # Model:
   jnt_qposadr: wp.array[int],
@@ -3169,7 +3169,7 @@ def _accumulate_jac_chain(
     bid = body_parentid[bid]
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _spatial_site_tendon(
   # Model:
   body_parentid: wp.array[int],
@@ -3252,7 +3252,7 @@ def _spatial_site_tendon(
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _spatial_geom_tendon(
   # Model:
   body_parentid: wp.array[int],

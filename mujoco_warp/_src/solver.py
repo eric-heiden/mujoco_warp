@@ -913,7 +913,7 @@ def linesearch_iterative(ls_iterations: int, cone_type: types.ConeType, fuse_jv:
     _compute_efc_eval_pt_alpha_zero = _compute_efc_eval_pt_alpha_zero_pyramidal
     _compute_efc_eval_pt_3alphas = _compute_efc_eval_pt_3alphas_pyramidal
 
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def kernel(
     # Model:
     nv: int,
@@ -1412,7 +1412,7 @@ def linesearch_zero_jv(
 
 @cache_kernel
 def linesearch_jv_fused(is_sparse: bool, nv: int, dofs_per_thread: int):
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def kernel(
     # Data in:
     nefc_in: wp.array[int],
@@ -1473,7 +1473,7 @@ def linesearch_jv_fused(is_sparse: bool, nv: int, dofs_per_thread: int):
 
 @cache_kernel
 def linesearch_prepare_gauss(nv: int, dofs_per_thread: int):
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def kernel(
     # Data in:
     qfrc_smooth_in: wp.array2d[float],
@@ -1616,7 +1616,7 @@ def linesearch_prepare_quad(
   ctx_quad_out[worldid, efcid] = quad
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def linesearch_qacc_ma(
   # In:
   ctx_search_in: wp.array2d[float],
@@ -1637,7 +1637,7 @@ def linesearch_qacc_ma(
   efc_Ma_out[worldid, dofid] += alpha * ctx_mv_in[worldid, dofid]
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def linesearch_jaref(
   # Data in:
   nefc_in: wp.array[int],
@@ -1721,7 +1721,7 @@ def solve_init_efc(
 
 @cache_kernel
 def solve_init_jaref(is_sparse: bool, nv: int, dofs_per_thread: int):
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def kernel(
     # Data in:
     nefc_in: wp.array[int],
@@ -1768,7 +1768,7 @@ def solve_init_jaref(is_sparse: bool, nv: int, dofs_per_thread: int):
   return kernel
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def solve_init_search(
   # In:
   ctx_Mgrad_in: wp.array2d[float],
@@ -1806,7 +1806,7 @@ def update_constraint_init_cost(
 def update_constraint_efc(track_changes: bool):
   TRACK_CHANGES = track_changes
 
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def kernel(
     # Model:
     opt_impratio_invsqrt: wp.array[float],
@@ -1951,7 +1951,7 @@ def update_constraint_efc(track_changes: bool):
   return kernel
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def update_constraint_init_qfrc_constraint_sparse(
   # Data in:
   nefc_in: wp.array[int],
@@ -2012,7 +2012,7 @@ def update_constraint_init_qfrc_constraint_dense(
 
 @cache_kernel
 def update_constraint_gauss_cost(nv: int, dofs_per_thread: int):
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def kernel(
     # Data in:
     qacc_in: wp.array2d[float],
@@ -2051,7 +2051,7 @@ def update_constraint_gauss_cost(nv: int, dofs_per_thread: int):
   return kernel
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def update_gradient_h_incremental(
   # Data in:
   efc_J_in: wp.array3d[float],
@@ -2098,7 +2098,7 @@ def update_gradient_h_incremental(
     ctx_h_out[worldid, i, j] += delta
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def update_gradient_h_incremental_sparse(
   # Data in:
   efc_J_rownnz_in: wp.array2d[int],
@@ -2234,7 +2234,7 @@ def update_gradient_zero_grad_dot(
   ctx_grad_dot_out[worldid] = 0.0
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def update_gradient_grad(
   # Data in:
   qfrc_smooth_in: wp.array2d[float],
@@ -2256,7 +2256,7 @@ def update_gradient_grad(
   wp.atomic_add(ctx_grad_dot_out, worldid, grad * grad)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def update_gradient_set_h_qM_lower_sparse(
   # Model:
   qM_fullm_i: wp.array[int],
@@ -2426,7 +2426,7 @@ def update_gradient_JTDAJ_dense_tiled(nv_pad: int, tile_size: int, njmax: int):
 
 
 # TODO(thowell): combine with JTDAJ ?
-@wp.kernel
+@wp.kernel(deterministic=False)
 def update_gradient_JTCJ_sparse(
   # Model:
   opt_impratio_invsqrt: wp.array[float],
@@ -2588,7 +2588,7 @@ def update_gradient_JTCJ_sparse(
     ctx_h_out[worldid, dof1id, dof2id] += h
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def update_gradient_JTCJ_dense(
   # Model:
   opt_impratio_invsqrt: wp.array[float],
@@ -2823,7 +2823,7 @@ def _cholesky_factorize_solve(m: types.Model, d: types.Data, ctx: SolverContext)
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _JTDAJ_sparse(
   # Data in:
   nefc_in: wp.array[int],
@@ -3120,7 +3120,7 @@ def solve_zero_search_dot(
   ctx_search_dot_out[worldid] = 0.0
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def solve_search_update(
   # Model:
   opt_solver: int,
@@ -3147,7 +3147,7 @@ def solve_search_update(
   wp.atomic_add(ctx_search_dot_out, worldid, search * search)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def solve_done(
   # Model:
   nv: int,

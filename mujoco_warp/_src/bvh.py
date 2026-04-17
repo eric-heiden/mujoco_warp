@@ -605,7 +605,7 @@ def build_hfield_bvh(
   return mesh, half
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def accumulate_flex_vertex_normals(
   # Model:
   nflex: int,

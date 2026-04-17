@@ -274,7 +274,7 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
   wp.copy(d.qacc_warmstart, d.qacc)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _euler_damp_qfrc_sparse(
   # Model:
   opt_timestep: wp.array[float],
@@ -400,7 +400,7 @@ def _rk_perturb_state(
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _rk_accumulate_velocity_acceleration(
   # Data in:
   qvel_in: wp.array2d[float],
@@ -416,7 +416,7 @@ def _rk_accumulate_velocity_acceleration(
   qacc_out[worldid, dofid] += scale * qacc_in[worldid, dofid]
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _rk_accumulate_activation_velocity(
   # Data in:
   act_dot_in: wp.array2d[float],
@@ -735,7 +735,7 @@ def _actuator_force(
   actuator_force_out[worldid, uid] = force
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _tendon_actuator_force(
   # Model:
   actuator_trntype: wp.array[int],
@@ -753,7 +753,7 @@ def _tendon_actuator_force(
     wp.atomic_add(ten_actfrc_out[worldid], tenid, actuator_force_in[worldid, actid])
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _tendon_actuator_force_clamp(
   # Model:
   tendon_actfrclimited: wp.array[bool],
@@ -779,7 +779,7 @@ def _tendon_actuator_force_clamp(
         actuator_force_out[worldid, actid] *= actfrcrange[1] / ten_actfrc
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _qfrc_actuator(
   # Data in:
   moment_rownnz_in: wp.array2d[int],

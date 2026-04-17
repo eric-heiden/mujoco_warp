@@ -1299,7 +1299,7 @@ _PRIMITIVE_COLLISIONS = {
 
 @cache_kernel
 def _primitive_narrowphase(primitive_collisions_types, primitive_collisions_func):
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def primitive_narrowphase(
     # Model:
     geom_type: wp.array[int],

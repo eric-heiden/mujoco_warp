@@ -168,7 +168,7 @@ def _qderiv_actuator_passive_actuation_dense(
     qDeriv_out[worldid, dofjid, dofiid] = qderiv_contrib
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _qderiv_actuator_passive_actuation_sparse(
   # Model:
   M_rownnz: wp.array[int],
@@ -263,7 +263,7 @@ def _qderiv_actuator_passive(
 
 
 # TODO(team): improve performance with tile operations?
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _qderiv_tendon_damping(
   # Model:
   ntendon: int,

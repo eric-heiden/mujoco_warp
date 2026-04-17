@@ -165,7 +165,7 @@ def ccd_hfield_kernel_builder(
   """Kernel builder for heightfield CCD collisions (no multiccd args)."""
 
   # runs convex collision on a set of geom pairs to recover contact info
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def ccd_hfield_kernel(
     # Model:
     opt_ccd_tolerance: wp.array[float],
@@ -890,7 +890,7 @@ def ccd_kernel_builder(
     return nactive
 
   # runs convex collision on a set of geom pairs to recover contact info (non-heightfield)
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def ccd_kernel(
     # Model:
     opt_ccd_tolerance: wp.array[float],

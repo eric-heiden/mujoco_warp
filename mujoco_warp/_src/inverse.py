@@ -31,7 +31,7 @@ from mujoco_warp._src.types import Model
 wp.set_module_options({"enable_backward": False})
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _qfrc_eulerdamp(
   # Model:
   opt_timestep: wp.array[float],

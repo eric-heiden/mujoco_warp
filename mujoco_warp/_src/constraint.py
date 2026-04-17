@@ -121,7 +121,7 @@ def _efc_row(
   id_out[worldid, efcid] = id
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _equality_connect(
   # Model:
   nv: int,
@@ -364,7 +364,7 @@ def _equality_connect(
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _equality_joint(
   # Model:
   nv: int,
@@ -495,7 +495,7 @@ def _equality_joint(
   )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _equality_tendon(
   # Model:
   nv: int,
@@ -675,7 +675,7 @@ def _equality_tendon(
 
 @cache_kernel
 def _equality_flex(is_sparse: bool):
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def kernel(
     # Model:
     nv: int,
@@ -789,7 +789,7 @@ def _equality_flex(is_sparse: bool):
   return kernel
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _equality_weld(
   # Model:
   nv: int,
@@ -1110,7 +1110,7 @@ def _equality_weld(
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _friction_dof(
   # Model:
   nv: int,
@@ -1200,7 +1200,7 @@ def _friction_dof(
   )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _friction_tendon(
   # Model:
   nv: int,
@@ -1313,7 +1313,7 @@ def _friction_tendon(
   )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _limit_slide_hinge(
   # Model:
   nv: int,
@@ -1418,7 +1418,7 @@ def _limit_slide_hinge(
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _limit_ball(
   # Model:
   nv: int,
@@ -1543,7 +1543,7 @@ def _limit_ball(
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _limit_tendon(
   # Model:
   nv: int,
@@ -1665,7 +1665,7 @@ def _limit_tendon(
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _contact_pyramidal(
   # Model:
   nv: int,
@@ -1936,7 +1936,7 @@ def _contact_pyramidal(
     )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _contact_elliptic(
   # Model:
   nv: int,

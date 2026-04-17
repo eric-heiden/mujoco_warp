@@ -22,7 +22,7 @@ from mujoco_warp._src.types import RenderContext
 wp.set_module_options({"enable_backward": False})
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _convert_texture_data(
   # In:
   width: int,
@@ -131,7 +131,7 @@ def pack_rgba_to_uint32(r: float, g: float, b: float, a: float) -> wp.uint32:
   return wp.uint32((int(a) << int(24)) | (int(r) << int(16)) | (int(g) << int(8)) | int(b))
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def unpack_rgb_kernel(
   # In:
   packed: wp.array2d[wp.uint32],
@@ -154,7 +154,7 @@ def unpack_rgb_kernel(
   rgb_out[worldid, yid, xid] = wp.vec3(r, g, b)
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def extract_depth_kernel(
   # In:
   depth_data: wp.array2d[float],
@@ -208,7 +208,7 @@ def get_depth(rc: RenderContext, camera_index: int, depth_scale: float, depth_ou
   )
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _extract_seg_kernel(
   # In:
   seg_data: wp.array2d[int],

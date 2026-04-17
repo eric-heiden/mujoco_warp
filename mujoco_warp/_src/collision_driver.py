@@ -78,7 +78,7 @@ MJ_COLLISION_TABLE = {
 }
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _zero_nacon_ncollision(
   # Data out:
   nacon_out: wp.array[int],
@@ -372,7 +372,7 @@ def _binary_search(values: wp.array[Any], value: Any, lower: int, upper: int) ->
 
 
 def _sap_project(opt_broadphase: int):
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def sap_project(
     # Model:
     ngeom: int,
@@ -418,7 +418,7 @@ def _sap_project(opt_broadphase: int):
   return sap_project
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _sap_range(
   # Model:
   ngeom: int,
@@ -445,7 +445,7 @@ def _sap_range(
 
 @cache_kernel
 def _sap_broadphase(opt_broadphase_filter: int, ngeom_aabb: int, ngeom_rbound: int, ngeom_margin: int):
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def kernel(
     # Model:
     ngeom: int,
@@ -526,7 +526,7 @@ def _sap_broadphase(opt_broadphase_filter: int, ngeom_aabb: int, ngeom_rbound: i
 
 
 def _segmented_sort(tile_size: int):
-  @wp.kernel(module="unique")
+  @wp.kernel(module="unique", deterministic=False)
   def segmented_sort(
     # In:
     projection_lower_in: wp.array2d[float],
@@ -646,7 +646,7 @@ def sap_broadphase(m: Model, d: Data, ctx: CollisionContext):
 
 @cache_kernel
 def _nxn_broadphase(opt_broadphase_filter: int, ngeom_aabb: int, ngeom_rbound: int, ngeom_margin: int):
-  @wp.kernel(module="unique", enable_backward=False)
+  @wp.kernel(module="unique", enable_backward=False, deterministic=False)
   def kernel(
     # Model:
     geom_type: wp.array[int],
@@ -758,7 +758,7 @@ def _narrowphase(m: Model, d: Data, ctx: CollisionContext):
 _CONTACT_SORT_GCID_MAX = 8
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _compute_contact_sort_keys(
   # Model:
   ngeom: int,
@@ -785,7 +785,7 @@ def _compute_contact_sort_keys(
   sort_keys_out[cid] = ((wid * ngeom + geom[0]) * ngeom + geom[1]) * gcid_max + gcid
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _permute_contacts(
   # Data in:
   nacon_in: wp.array[int],

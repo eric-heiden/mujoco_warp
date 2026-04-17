@@ -661,7 +661,7 @@ def gradient_descent(
   return dist, pos3, n
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _sdf_narrowphase(
   # Model:
   nmeshface: int,

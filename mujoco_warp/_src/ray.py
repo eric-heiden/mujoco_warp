@@ -906,7 +906,7 @@ def _ray_geom_mesh(
     return -1.0, wp.vec3()
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _ray(
   # Model:
   ngeom: int,
@@ -1079,7 +1079,7 @@ def _ray_geom_mesh_bvh(
   return -1.0, wp.vec3()
 
 
-@wp.kernel
+@wp.kernel(deterministic=False)
 def _ray_bvh(
   # Model:
   ngeom: int,
