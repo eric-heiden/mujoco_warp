@@ -1753,24 +1753,50 @@ def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
     qfrc_smooth_ref = d.qfrc_smooth
     qpos_ref = d.qpos
     qvel_ref = d.qvel
+    M_ref = d.M
+    cdof_ref = d.cdof
+    crb_ref = d.crb
+    cinert_ref = d.cinert
 
     if getattr(d, "smooth_adjoint", 0):
       from mujoco_warp._src.adjoint import solver_smooth_adjoint
 
       tape.record_func(
-        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref, qf=qfrc_smooth_ref, qp=qpos_ref, qv=qvel_ref: solver_smooth_adjoint(
-          m, d, qacc_array=qa, qacc_smooth_ref=qs, qfrc_smooth_ref=qf, qpos_ref=qp, qvel_ref=qv
+        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref, qf=qfrc_smooth_ref, qp=qpos_ref, qv=qvel_ref, M=M_ref, cd=cdof_ref, cr=crb_ref, ci=cinert_ref, t=tape: solver_smooth_adjoint(
+          m,
+          d,
+          qacc_array=qa,
+          qacc_smooth_ref=qs,
+          qfrc_smooth_ref=qf,
+          qpos_ref=qp,
+          qvel_ref=qv,
+          M_ref=M,
+          cdof_ref=cd,
+          crb_ref=cr,
+          cinert_ref=ci,
+          tape_ref=t,
         ),
-        [qacc_array, qacc_smooth_ref, qfrc_smooth_ref, qpos_ref, qvel_ref],
+        [qacc_array, qacc_smooth_ref, qfrc_smooth_ref, qpos_ref, qvel_ref, M_ref, cdof_ref, crb_ref, cinert_ref],
       )
     else:
       from mujoco_warp._src.adjoint import solver_implicit_adjoint
 
       tape.record_func(
-        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref, qf=qfrc_smooth_ref, qp=qpos_ref, qv=qvel_ref: solver_implicit_adjoint(
-          m, d, qacc_array=qa, qacc_smooth_ref=qs, qfrc_smooth_ref=qf, qpos_ref=qp, qvel_ref=qv
+        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref, qf=qfrc_smooth_ref, qp=qpos_ref, qv=qvel_ref, M=M_ref, cd=cdof_ref, cr=crb_ref, ci=cinert_ref, t=tape: solver_implicit_adjoint(
+          m,
+          d,
+          qacc_array=qa,
+          qacc_smooth_ref=qs,
+          qfrc_smooth_ref=qf,
+          qpos_ref=qp,
+          qvel_ref=qv,
+          M_ref=M,
+          cdof_ref=cd,
+          crb_ref=cr,
+          cinert_ref=ci,
+          tape_ref=t,
         ),
-        [qacc_array, qacc_smooth_ref, qfrc_smooth_ref, qpos_ref, qvel_ref],
+        [qacc_array, qacc_smooth_ref, qfrc_smooth_ref, qpos_ref, qvel_ref, M_ref, cdof_ref, crb_ref, cinert_ref],
       )
 
 

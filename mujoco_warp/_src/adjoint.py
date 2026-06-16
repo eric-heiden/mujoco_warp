@@ -317,7 +317,6 @@ def _limit_row_grad_kernel(
   is_sparse: bool,
   opt_timestep: wp.array[float],
   opt_disableflags: int,
-  qpos_scale: float,
   jnt_qposadr: wp.array[int],
   jnt_dofadr: wp.array[int],
   jnt_solref: wp.array2d[wp.vec2],
@@ -399,7 +398,7 @@ def _limit_row_grad_kernel(
     J_qpos = efc_J_in[worldid, efcid, dofid]
 
   qposadr = jnt_qposadr[jntid]
-  wp.atomic_add(qpos_grad_out, worldid, qposadr, qpos_scale * (adj_aref * daref_dpos + adj_D * dD_dpos) * J_qpos)
+  wp.atomic_add(qpos_grad_out, worldid, qposadr, (adj_aref * daref_dpos + adj_D * dD_dpos) * J_qpos)
 
   timeconst = solref[0]
   if not (opt_disableflags & DisableBit.REFSAFE):
@@ -860,6 +859,40 @@ def _accumulate_grad_kernel(
   dst_out[worldid, dofid] = dst_out[worldid, dofid] + src[worldid, dofid]
 
 
+@wp.kernel
+def _accumulate_grad_3d_kernel(
+  # In:
+  src: wp.array3d[float],
+  # Out:
+  dst_out: wp.array3d[float],
+):
+  worldid, row, col = wp.tid()
+  dst_out[worldid, row, col] = dst_out[worldid, row, col] + src[worldid, row, col]
+
+
+@wp.kernel
+def _accumulate_dense_solver_m_correction_grad(
+  # In:
+  v: wp.array2d[float],
+  qacc_in: wp.array2d[float],
+  qacc_smooth_in: wp.array2d[float],
+  # Out:
+  M_grad_out: wp.array3d[float],
+):
+  worldid, row, col = wp.tid()
+
+  if row > col:
+    return
+
+  delta_col = qacc_in[worldid, col] - qacc_smooth_in[worldid, col]
+  grad = -v[worldid, row] * delta_col
+  if row != col:
+    delta_row = qacc_in[worldid, row] - qacc_smooth_in[worldid, row]
+    grad -= v[worldid, col] * delta_row
+
+  M_grad_out[worldid, row, col] = M_grad_out[worldid, row, col] + grad
+
+
 @cache_kernel
 def _adjoint_cholesky_tile(nv: int):
   @wp.kernel(module="unique", enable_backward=False)
@@ -1050,6 +1083,56 @@ def _solve_hessian_system(m: types.Model, d: types.Data, b, out, H=None):
       )
 
 
+def _accumulate_solver_mass_correction_vjp(
+  m: types.Model,
+  d: types.Data,
+  v,
+  qacc_array,
+  qacc_smooth_ref,
+  M_ref=None,
+  cdof_ref=None,
+  crb_ref=None,
+  cinert_ref=None,
+  tape_ref=None,
+):
+  if m.is_sparse or os.environ.get("MJW_DISABLE_SOLVER_M_CORRECTION_VJP") == "1":
+    return
+  if M_ref is None:
+    M_ref = d.M
+  if cdof_ref is None:
+    cdof_ref = d.cdof
+  if crb_ref is None:
+    crb_ref = d.crb
+  if cinert_ref is None:
+    cinert_ref = d.cinert
+
+  tape = tape_ref if tape_ref is not None else wp._src.context.runtime.tape
+  if tape is None:
+    return
+  if not hasattr(M_ref, "grad") or M_ref.grad is None:
+    M_ref.grad = wp.zeros_like(M_ref)
+    tape.gradients[M_ref] = M_ref.grad
+
+  M_grad_contrib = wp.zeros_like(M_ref)
+  wp.launch(
+    _accumulate_dense_solver_m_correction_grad,
+    dim=(d.nworld, m.nv, m.nv),
+    inputs=[v, qacc_array, qacc_smooth_ref],
+    outputs=[M_grad_contrib],
+  )
+  wp.launch(
+    _accumulate_grad_3d_kernel,
+    dim=(d.nworld, m.nv, m.nv),
+    inputs=[M_grad_contrib],
+    outputs=[M_ref.grad],
+  )
+
+  if os.environ.get("MJW_DISABLE_M_VJP") != "1":
+    from mujoco_warp._src import smooth
+
+    smooth.accumulate_dense_M_adjoint(m, d, M_grad_contrib, cdof_ref, crb_ref, cinert_ref, tape)
+
+
 def solver_implicit_adjoint(
   m: types.Model,
   d: types.Data,
@@ -1058,6 +1141,11 @@ def solver_implicit_adjoint(
   qfrc_smooth_ref=None,
   qpos_ref=None,
   qvel_ref=None,
+  M_ref=None,
+  cdof_ref=None,
+  crb_ref=None,
+  cinert_ref=None,
+  tape_ref=None,
 ):
   """Implicit differentiation adjoint for constraint solver.
 
@@ -1166,6 +1254,18 @@ def solver_implicit_adjoint(
     outputs=[qacc_smooth_grad],
   )
   _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, tmp)
+  _accumulate_solver_mass_correction_vjp(
+    m,
+    d,
+    v,
+    qacc_array,
+    qacc_smooth_ref,
+    M_ref=M_ref,
+    cdof_ref=cdof_ref,
+    crb_ref=crb_ref,
+    cinert_ref=cinert_ref,
+    tape_ref=tape_ref,
+  )
 
   # Phase 3: compute efc-level gradients for collision chain
   qacc_for_grad = qacc_array if qacc_array is not None else d.qacc
@@ -1275,7 +1375,6 @@ def _efc_level_gradients(m: types.Model, d: types.Data, v, qacc, qpos_ref=None, 
     if os.environ.get("MJW_DISABLE_EFC_POS_VJP") != "1" and "limit_aref_grad" in locals() and limit_aref_grad is not None:
       qpos_grad = _ensure_grad(qpos_ref)
       qvel_grad = _ensure_grad(qvel_ref)
-      limit_qpos_scale = float(os.environ.get("MJW_LIMIT_ROW_QPOS_SCALE", "1.0"))
       wp.launch(
         _limit_row_grad_kernel,
         dim=(d.nworld, d.njmax),
@@ -1284,7 +1383,6 @@ def _efc_level_gradients(m: types.Model, d: types.Data, v, qacc, qpos_ref=None, 
           m.is_sparse,
           m.opt.timestep,
           m.opt.disableflags,
-          limit_qpos_scale,
           m.jnt_qposadr,
           m.jnt_dofadr,
           m.jnt_solref,
@@ -1352,6 +1450,11 @@ def solver_smooth_adjoint(
   qfrc_smooth_ref=None,
   qpos_ref=None,
   qvel_ref=None,
+  M_ref=None,
+  cdof_ref=None,
+  crb_ref=None,
+  cinert_ref=None,
+  tape_ref=None,
 ):
   """Smooth constraint adjoint for friction gradient signal.
 
@@ -1613,6 +1716,18 @@ def solver_smooth_adjoint(
     outputs=[qacc_smooth_grad],
   )
   _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, tmp)
+  _accumulate_solver_mass_correction_vjp(
+    m,
+    d,
+    v,
+    qacc_array,
+    qacc_smooth_ref,
+    M_ref=M_ref,
+    cdof_ref=cdof_ref,
+    crb_ref=crb_ref,
+    cinert_ref=cinert_ref,
+    tape_ref=tape_ref,
+  )
 
   # Phase 3: efc-level gradients for collision chain
   qacc_for_grad = qacc_array if qacc_array is not None else d.qacc
