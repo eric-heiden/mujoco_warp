@@ -666,6 +666,93 @@ def _cinert(
   cinert_out[worldid, bodyid] = res
 
 
+@wp.kernel(enable_backward=False)
+def _accumulate_cinert_adjoint(
+  # Model:
+  body_rootid: wp.array[int],
+  body_mass: wp.array2d[float],
+  body_inertia: wp.array2d[wp.vec3],
+  # Data in:
+  xipos_in: wp.array2d[wp.vec3],
+  ximat_in: wp.array2d[wp.mat33],
+  subtree_com_in: wp.array2d[wp.vec3],
+  cinert_grad_in: wp.array2d[vec10],
+  # Data out:
+  xipos_grad_out: wp.array2d[wp.vec3],
+  ximat_grad_out: wp.array2d[wp.mat33],
+  subtree_com_grad_out: wp.array2d[wp.vec3],
+):
+  worldid, bodyid = wp.tid()
+  rootid = body_rootid[bodyid]
+  mat = ximat_in[worldid, bodyid]
+  inert = body_inertia[worldid % body_inertia.shape[0], bodyid]
+  mass = body_mass[worldid % body_mass.shape[0], bodyid]
+  dif = xipos_in[worldid, bodyid] - subtree_com_in[worldid, rootid]
+  g = cinert_grad_in[worldid, bodyid]
+
+  gdif = mass * wp.vec3(
+    2.0 * dif[0] * (g[1] + g[2]) - dif[1] * g[3] - dif[2] * g[4] + g[6],
+    2.0 * dif[1] * (g[0] + g[2]) - dif[0] * g[3] - dif[2] * g[5] + g[7],
+    2.0 * dif[2] * (g[0] + g[1]) - dif[0] * g[4] - dif[1] * g[5] + g[8],
+  )
+  wp.atomic_add(xipos_grad_out, worldid, bodyid, gdif)
+  wp.atomic_add(subtree_com_grad_out, worldid, rootid, -gdif)
+
+  # res_rot = mat * diag(inert) * mat^T, but only the upper-triangle
+  # entries are stored in vec10.  The VJP is (H + H^T) * mat * diag(inert),
+  # where H contains the upper-triangle adjoints.
+  sym_grad = wp.mat33(
+    2.0 * g[0],
+    g[3],
+    g[4],
+    g[3],
+    2.0 * g[1],
+    g[5],
+    g[4],
+    g[5],
+    2.0 * g[2],
+  )
+  mat_inert = mat @ wp.diag(inert)
+  ximat_grad_out[worldid, bodyid] = ximat_grad_out[worldid, bodyid] + sym_grad @ mat_inert
+
+
+def _record_cinert_adjoint(m: Model, d: Data):
+  tape = wp._src.context.runtime.tape
+  if tape is None or not d.qpos.requires_grad:
+    return
+
+  xipos_ref = d.xipos
+  ximat_ref = d.ximat
+  subtree_com_ref = d.subtree_com
+  cinert_ref = d.cinert
+
+  def _adjoint(
+    m=m,
+    d=d,
+    xipos=xipos_ref,
+    ximat=ximat_ref,
+    subtree_com=subtree_com_ref,
+    cinert=cinert_ref,
+  ):
+    if cinert.grad is None:
+      return
+    if xipos.grad is None:
+      xipos.grad = wp.zeros_like(xipos)
+    if ximat.grad is None:
+      ximat.grad = wp.zeros_like(ximat)
+    if subtree_com.grad is None:
+      subtree_com.grad = wp.zeros_like(subtree_com)
+
+    wp.launch(
+      _accumulate_cinert_adjoint,
+      dim=(d.nworld, m.nbody),
+      inputs=[m.body_rootid, m.body_mass, m.body_inertia, xipos, ximat, subtree_com, cinert.grad],
+      outputs=[xipos.grad, ximat.grad, subtree_com.grad],
+    )
+
+  tape.record_func(_adjoint, [xipos_ref, ximat_ref, subtree_com_ref, cinert_ref])
+
+
 @wp.kernel
 def _cdof(
   # Model:
@@ -1360,6 +1447,204 @@ def _cfrc(
   cfrc_int_out[worldid, bodyid] = frc
 
 
+@wp.func
+def _inert_vec_inertia_vjp(v: wp.spatial_vector, g: wp.spatial_vector) -> vec10:
+  res = vec10()
+  res[0] = g[0] * v[0]
+  res[1] = g[1] * v[1]
+  res[2] = g[2] * v[2]
+  res[3] = g[0] * v[1] + g[1] * v[0]
+  res[4] = g[0] * v[2] + g[2] * v[0]
+  res[5] = g[1] * v[2] + g[2] * v[1]
+  res[6] = -g[1] * v[5] + g[2] * v[4] + g[4] * v[2] - g[5] * v[1]
+  res[7] = g[0] * v[5] - g[2] * v[3] - g[3] * v[2] + g[5] * v[0]
+  res[8] = -g[0] * v[4] + g[1] * v[3] + g[3] * v[1] - g[4] * v[0]
+  res[9] = g[3] * v[3] + g[4] * v[4] + g[5] * v[5]
+  return res
+
+
+@wp.func
+def _motion_cross_force_rhs_vjp(v: wp.spatial_vector, g: wp.spatial_vector) -> wp.spatial_vector:
+  v_ang = wp.spatial_top(v)
+  v_lin = wp.spatial_bottom(v)
+  g_ang = wp.spatial_top(g)
+  g_lin = wp.spatial_bottom(g)
+  p_ang_grad = wp.cross(g_ang, v_ang)
+  p_lin_grad = wp.cross(g_ang, v_lin) + wp.cross(g_lin, v_ang)
+  return wp.spatial_vector(p_ang_grad, p_lin_grad)
+
+
+@wp.kernel(enable_backward=False)
+def _init_cfrc_base_grad(
+  # Data in:
+  cfrc_total_grad_in: wp.array2d[wp.spatial_vector],
+  # Data out:
+  cfrc_base_grad_out: wp.array2d[wp.spatial_vector],
+):
+  worldid, bodyid = wp.tid()
+  if bodyid == 0:
+    cfrc_base_grad_out[worldid, bodyid] = cfrc_total_grad_in[worldid, bodyid]
+  else:
+    cfrc_base_grad_out[worldid, bodyid] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+@wp.kernel(enable_backward=False)
+def _cfrc_total_to_base_grad_level(
+  # Model:
+  body_parentid: wp.array[int],
+  # Data in:
+  cfrc_total_grad_in: wp.array2d[wp.spatial_vector],
+  cfrc_base_grad_in: wp.array2d[wp.spatial_vector],
+  # In:
+  body_tree_: wp.array[int],
+  # Data out:
+  cfrc_base_grad_out: wp.array2d[wp.spatial_vector],
+):
+  worldid, nodeid = wp.tid()
+  bodyid = body_tree_[nodeid]
+  pid = body_parentid[bodyid]
+  g = cfrc_total_grad_in[worldid, bodyid]
+  if pid >= 0:
+    g = g + cfrc_base_grad_in[worldid, pid]
+  cfrc_base_grad_out[worldid, bodyid] = g
+
+
+@wp.kernel(enable_backward=False)
+def _accumulate_qfrc_bias_cfrc_total_grad(
+  # Model:
+  dof_bodyid: wp.array[int],
+  # Data in:
+  qfrc_bias_grad_in: wp.array2d[float],
+  cdof_in: wp.array2d[wp.spatial_vector],
+  # Data out:
+  cfrc_total_grad_out: wp.array2d[wp.spatial_vector],
+):
+  worldid, dofid = wp.tid()
+  bodyid = dof_bodyid[dofid]
+  wp.atomic_add(cfrc_total_grad_out, worldid, bodyid, cdof_in[worldid, dofid] * qfrc_bias_grad_in[worldid, dofid])
+
+
+@wp.kernel(enable_backward=False)
+def _accumulate_cfrc_cinert_adjoint(
+  # Data in:
+  cacc_in: wp.array2d[wp.spatial_vector],
+  cvel_in: wp.array2d[wp.spatial_vector],
+  cfrc_base_grad_in: wp.array2d[wp.spatial_vector],
+  # Data out:
+  cinert_grad_out: wp.array2d[vec10],
+):
+  worldid, bodyid = wp.tid()
+  if bodyid == 0:
+    return
+
+  g = cfrc_base_grad_in[worldid, bodyid]
+  cacc = cacc_in[worldid, bodyid]
+  cvel = cvel_in[worldid, bodyid]
+
+  grad = _inert_vec_inertia_vjp(cacc, g)
+  cvel_grad = _motion_cross_force_rhs_vjp(cvel, g)
+  cross_grad = _inert_vec_inertia_vjp(cvel, cvel_grad)
+
+  current = cinert_grad_out[worldid, bodyid]
+  current[0] = current[0] + grad[0] + cross_grad[0]
+  current[1] = current[1] + grad[1] + cross_grad[1]
+  current[2] = current[2] + grad[2] + cross_grad[2]
+  current[3] = current[3] + grad[3] + cross_grad[3]
+  current[4] = current[4] + grad[4] + cross_grad[4]
+  current[5] = current[5] + grad[5] + cross_grad[5]
+  current[6] = current[6] + grad[6] + cross_grad[6]
+  current[7] = current[7] + grad[7] + cross_grad[7]
+  current[8] = current[8] + grad[8] + cross_grad[8]
+  current[9] = current[9] + grad[9] + cross_grad[9]
+  cinert_grad_out[worldid, bodyid] = current
+
+
+def _record_cfrc_adjoint(m: Model, d: Data, cfrc_total_array: wp.array):
+  tape = wp._src.context.runtime.tape
+  if tape is None or not d.qpos.requires_grad:
+    return
+
+  cinert_ref = d.cinert
+  xipos_ref = d.xipos
+  ximat_ref = d.ximat
+  subtree_com_ref = d.subtree_com
+  cacc_ref = d.cacc
+  cvel_ref = d.cvel
+  cdof_ref = d.cdof
+  qfrc_bias_ref = d.qfrc_bias
+  cfrc_total_ref = cfrc_total_array
+
+  def _adjoint(
+    m=m,
+    d=d,
+    cinert=cinert_ref,
+    xipos=xipos_ref,
+    ximat=ximat_ref,
+    subtree_com=subtree_com_ref,
+    cacc=cacc_ref,
+    cvel=cvel_ref,
+    cdof=cdof_ref,
+    qfrc_bias=qfrc_bias_ref,
+    cfrc_total=cfrc_total_ref,
+  ):
+    if cfrc_total.grad is None and qfrc_bias.grad is None:
+      return
+
+    if cfrc_total.grad is None:
+      cfrc_total_grad = wp.zeros_like(cfrc_total)
+    else:
+      cfrc_total_grad = wp.clone(cfrc_total.grad)
+
+    if qfrc_bias.grad is not None:
+      wp.launch(
+        _accumulate_qfrc_bias_cfrc_total_grad,
+        dim=(d.nworld, m.nv),
+        inputs=[m.dof_bodyid, qfrc_bias.grad, cdof],
+        outputs=[cfrc_total_grad],
+      )
+
+    cfrc_base_grad = wp.zeros_like(cfrc_total)
+    wp.launch(
+      _init_cfrc_base_grad,
+      dim=(d.nworld, m.nbody),
+      inputs=[cfrc_total_grad],
+      outputs=[cfrc_base_grad],
+    )
+    for body_tree in m.body_tree:
+      wp.launch(
+        _cfrc_total_to_base_grad_level,
+        dim=(d.nworld, body_tree.size),
+        inputs=[m.body_parentid, cfrc_total_grad, cfrc_base_grad, body_tree],
+        outputs=[cfrc_base_grad],
+      )
+
+    cinert_force_grad = wp.zeros_like(cinert)
+    wp.launch(
+      _accumulate_cfrc_cinert_adjoint,
+      dim=(d.nworld, m.nbody),
+      inputs=[cacc, cvel, cfrc_base_grad],
+      outputs=[cinert_force_grad],
+    )
+
+    if xipos.grad is None:
+      xipos.grad = wp.zeros_like(xipos)
+    if ximat.grad is None:
+      ximat.grad = wp.zeros_like(ximat)
+    if subtree_com.grad is None:
+      subtree_com.grad = wp.zeros_like(subtree_com)
+    wp.launch(
+      _accumulate_cinert_adjoint,
+      dim=(d.nworld, m.nbody),
+      inputs=[m.body_rootid, m.body_mass, m.body_inertia, xipos, ximat, subtree_com, cinert_force_grad],
+      outputs=[xipos.grad, ximat.grad, subtree_com.grad],
+    )
+
+  tape.record_func(
+    _adjoint,
+    [cinert_ref, xipos_ref, ximat_ref, subtree_com_ref, cacc_ref, cvel_ref, cdof_ref, qfrc_bias_ref, cfrc_total_ref],
+  )
+
+
 def _rne_cfrc(m: Model, d: Data, flg_cfrc_ext: bool = False):
   wp.launch(_cfrc, dim=[d.nworld, m.nbody], inputs=[d.cinert, d.cvel, d.cacc, d.cfrc_ext, flg_cfrc_ext], outputs=[d.cfrc_int])
 
@@ -1467,6 +1752,7 @@ def rne(m: Model, d: Data, flg_acc: bool = False):
   _rne_cfrc(m, d)
   cfrc_total = _rne_cfrc_backward(m, d)
   wp.launch(_qfrc_bias, dim=[d.nworld, m.nv], inputs=[m.dof_bodyid, d.cdof, cfrc_total], outputs=[d.qfrc_bias])
+  _record_cfrc_adjoint(m, d, cfrc_total)
   # update d.cfrc_int with accumulated forces for downstream consumers
   d.cfrc_int = cfrc_total
 
