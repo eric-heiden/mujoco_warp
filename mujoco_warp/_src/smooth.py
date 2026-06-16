@@ -978,25 +978,34 @@ def _M_dense(
   # Data out:
   M_out: wp.array3d[float],
 ):
-  worldid, dofid = wp.tid()
-  bodyid = dof_bodyid[dofid]
-  # init M(i,i) with armature inertia.
-  M = dof_armature[worldid % dof_armature.shape[0], dofid]
+  worldid, row, col = wp.tid()
 
-  # precompute buf = crb_body_i * cdof_i
-  buf = math.inert_vec(crb_in[worldid, bodyid], cdof_in[worldid, dofid])
-  M += wp.dot(cdof_in[worldid, dofid], buf)
+  if row == col:
+    bodyid = dof_bodyid[row]
+    buf = math.inert_vec(crb_in[worldid, bodyid], cdof_in[worldid, row])
+    M = dof_armature[worldid % dof_armature.shape[0], row] + wp.dot(cdof_in[worldid, row], buf)
+    M_out[worldid, row, col] = M
+    return
 
-  M_out[worldid, dofid, dofid] = M
+  M = float(0.0)
 
-  # sparse backward pass over ancestors
-  dofidi = dofid
-  dofid = dof_parentid[dofid]
-  while dofid >= 0:
-    Mij = wp.dot(cdof_in[worldid, dofid], buf)
-    M_out[worldid, dofidi, dofid] += Mij
-    M_out[worldid, dofid, dofidi] += Mij
-    dofid = dof_parentid[dofid]
+  cursor = row
+  while cursor >= 0:
+    if cursor == col:
+      bodyid = dof_bodyid[row]
+      buf = math.inert_vec(crb_in[worldid, bodyid], cdof_in[worldid, row])
+      M = wp.dot(cdof_in[worldid, col], buf)
+    cursor = dof_parentid[cursor]
+
+  cursor = col
+  while cursor >= 0:
+    if cursor == row:
+      bodyid = dof_bodyid[col]
+      buf = math.inert_vec(crb_in[worldid, bodyid], cdof_in[worldid, col])
+      M = wp.dot(cdof_in[worldid, row], buf)
+    cursor = dof_parentid[cursor]
+
+  M_out[worldid, row, col] = M
 
 
 @event_scope
@@ -1022,7 +1031,10 @@ def crb(m: Model, d: Data):
     )
   else:
     wp.launch(
-      _M_dense, dim=(d.nworld, m.nv), inputs=[m.dof_bodyid, m.dof_parentid, m.dof_armature, d.cdof, d.crb], outputs=[d.M]
+      _M_dense,
+      dim=(d.nworld, m.nv, m.nv),
+      inputs=[m.dof_bodyid, m.dof_parentid, m.dof_armature, d.cdof, d.crb],
+      outputs=[d.M],
     )
 
 

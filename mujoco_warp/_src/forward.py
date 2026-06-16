@@ -1414,12 +1414,38 @@ def fwd_acceleration(m: Model, d: Data, factorize: bool = False):
   _record_fwd_accel_adjoint(m, d)
 
 
+@wp.kernel
+def _accumulate_dense_mass_solve_m_grad(
+  # In:
+  v: wp.array2d[float],
+  x: wp.array2d[float],
+  # Out:
+  M_grad_out: wp.array3d[float],
+):
+  worldid, row, col = wp.tid()
+
+  if row > col:
+    return
+
+  grad = -v[worldid, row] * x[worldid, col]
+  if row != col:
+    grad -= v[worldid, col] * x[worldid, row]
+
+  M_grad_out[worldid, row, col] = M_grad_out[worldid, row, col] + grad
+
+
 def _record_fwd_accel_adjoint(m: Model, d: Data):
   """Record custom adjoint for the M_inv solve in fwd_acceleration.
 
   On the dense path, _tile_cholesky_factorize_solve has enable_backward=False.
-  This record_func propagates qacc_smooth.grad -> qfrc_smooth.grad via M_inv,
-  using the already-factored d.qLD from the forward pass.
+  This record_func propagates qacc_smooth.grad through x = M^-1 y, using the
+  already-factored d.qLD from the forward pass.  The VJP is:
+
+    y.grad += M^-T * x.grad
+    M.grad += -M^-T * x.grad * x^T
+
+  Dense MuJoCo-Warp Cholesky reads the upper triangle as the symmetric mass
+  matrix, so the dense M VJP is accumulated into the upper triangle only.
 
   Array references are captured at record time (not through d) so that
   intermediate array cloning between substeps routes each substep's adjoint
@@ -1430,10 +1456,11 @@ def _record_fwd_accel_adjoint(m: Model, d: Data):
     from mujoco_warp._src.adjoint import _accumulate_grad_kernel
 
     # Capture current array refs for correct gradient isolation across substeps
+    M_ref = d.M
     qacc_smooth_ref = d.qacc_smooth
     qfrc_smooth_ref = d.qfrc_smooth
 
-    def _adjoint(m=m, d=d, qacc_smooth=qacc_smooth_ref, qfrc_smooth=qfrc_smooth_ref):
+    def _adjoint(m=m, d=d, M=M_ref, qacc_smooth=qacc_smooth_ref, qfrc_smooth=qfrc_smooth_ref):
       adj_qacc_smooth = qacc_smooth.grad
       if adj_qacc_smooth is None:
         return
@@ -1451,7 +1478,17 @@ def _record_fwd_accel_adjoint(m: Model, d: Data):
           outputs=[qfrc_smooth.grad],
         )
 
-    tape.record_func(_adjoint, [qacc_smooth_ref, qfrc_smooth_ref])
+      if not m.is_sparse:
+        if M.grad is None:
+          M.grad = wp.zeros_like(M)
+        wp.launch(
+          _accumulate_dense_mass_solve_m_grad,
+          dim=(d.nworld, m.nv, m.nv),
+          inputs=[tmp, qacc_smooth],
+          outputs=[M.grad],
+        )
+
+    tape.record_func(_adjoint, [qacc_smooth_ref, qfrc_smooth_ref, M_ref])
 
 
 def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
@@ -1673,6 +1710,8 @@ def _isolate_intermediates_for_ad(m: Model, d: Data):
   d.cvel = wp.zeros_like(d.cvel, requires_grad=True)
   d.crb = wp.zeros_like(d.crb, requires_grad=True)
   d.cacc = wp.zeros_like(d.cacc, requires_grad=True)
+  d.cfrc_int = wp.zeros_like(d.cfrc_int, requires_grad=True)
+  d.cfrc_ext = wp.zeros_like(d.cfrc_ext, requires_grad=True)
 
   # --- Mass matrix ---
   # Shapes depend on sparse vs dense; zeros_like handles both.
