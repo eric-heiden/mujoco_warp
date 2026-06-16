@@ -1695,11 +1695,6 @@ def _cacc_level(
 
 def _rne_cacc_forward(m: Model, d: Data, flg_acc: bool = False):
   for body_tree in m.body_tree:
-    cacc_in = (
-      wp.clone(d.cacc)
-      if d.cacc.requires_grad and os.environ.get("MJW_DISABLE_RNE_CACC_CLONE") != "1"
-      else d.cacc
-    )
     wp.launch(
       _cacc_level,
       dim=(d.nworld, body_tree.size),
@@ -1714,7 +1709,7 @@ def _rne_cacc_forward(m: Model, d: Data, flg_acc: bool = False):
         d.qacc,
         d.cdof,
         d.cvel,
-        cacc_in,
+        d.cacc,
         flg_acc,
       ],
       outputs=[d.cacc],
@@ -1822,25 +1817,6 @@ def _cfrc_total_to_base_grad_level(
 
 
 @wp.kernel(enable_backward=False)
-def _accumulate_qfrc_bias_cfrc_total_grad(
-  # Model:
-  dof_bodyid: wp.array[int],
-  # Data in:
-  qfrc_bias_grad_in: wp.array2d[float],
-  cdof_in: wp.array2d[wp.spatial_vector],
-  cfrc_total_in: wp.array2d[wp.spatial_vector],
-  # Data out:
-  cfrc_total_grad_out: wp.array2d[wp.spatial_vector],
-  cdof_grad_out: wp.array2d[wp.spatial_vector],
-):
-  worldid, dofid = wp.tid()
-  bodyid = dof_bodyid[dofid]
-  qfrc_bias_grad = qfrc_bias_grad_in[worldid, dofid]
-  wp.atomic_add(cfrc_total_grad_out, worldid, bodyid, cdof_in[worldid, dofid] * qfrc_bias_grad)
-  wp.atomic_add(cdof_grad_out, worldid, dofid, cfrc_total_in[worldid, bodyid] * qfrc_bias_grad)
-
-
-@wp.kernel(enable_backward=False)
 def _accumulate_cfrc_cinert_adjoint(
   # Data in:
   cinert_in: wp.array2d[vec10],
@@ -1901,7 +1877,6 @@ def _record_cfrc_adjoint(m: Model, d: Data, cfrc_total_array: wp.array):
   cacc_ref = d.cacc
   cvel_ref = d.cvel
   cdof_ref = d.cdof
-  qfrc_bias_ref = d.qfrc_bias
   cfrc_total_ref = cfrc_total_array
 
   def _adjoint(
@@ -1914,31 +1889,12 @@ def _record_cfrc_adjoint(m: Model, d: Data, cfrc_total_array: wp.array):
     cacc=cacc_ref,
     cvel=cvel_ref,
     cdof=cdof_ref,
-    qfrc_bias=qfrc_bias_ref,
     cfrc_total=cfrc_total_ref,
   ):
-    if cfrc_total.grad is None and qfrc_bias.grad is None:
+    if cfrc_total.grad is None:
       return
 
-    if cfrc_total.grad is None:
-      cfrc_total_grad = wp.zeros_like(cfrc_total)
-    else:
-      cfrc_total_grad = wp.clone(cfrc_total.grad)
-
-    if qfrc_bias.grad is not None:
-      if os.environ.get("MJW_DISABLE_RNE_QFRC_BIAS_CDOF_VJP") != "1":
-        if cdof.grad is None:
-          cdof.grad = wp.zeros_like(cdof)
-          tape.gradients[cdof] = cdof.grad
-        cdof_grad = cdof.grad
-      else:
-        cdof_grad = wp.zeros_like(cdof)
-      wp.launch(
-        _accumulate_qfrc_bias_cfrc_total_grad,
-        dim=(d.nworld, m.nv),
-        inputs=[m.dof_bodyid, qfrc_bias.grad, cdof, cfrc_total],
-        outputs=[cfrc_total_grad, cdof_grad],
-      )
+    cfrc_total_grad = wp.clone(cfrc_total.grad)
 
     cfrc_base_grad = wp.zeros_like(cfrc_total)
     wp.launch(
@@ -1987,7 +1943,7 @@ def _record_cfrc_adjoint(m: Model, d: Data, cfrc_total_array: wp.array):
 
   tape.record_func(
     _adjoint,
-    [cinert_ref, xipos_ref, ximat_ref, subtree_com_ref, cacc_ref, cvel_ref, cdof_ref, qfrc_bias_ref, cfrc_total_ref],
+    [cinert_ref, xipos_ref, ximat_ref, subtree_com_ref, cacc_ref, cvel_ref, cdof_ref, cfrc_total_ref],
   )
 
 
@@ -2097,8 +2053,8 @@ def rne(m: Model, d: Data, flg_acc: bool = False):
   _rne_cacc_forward(m, d, flg_acc=flg_acc)
   _rne_cfrc(m, d)
   cfrc_total = _rne_cfrc_backward(m, d)
-  wp.launch(_qfrc_bias, dim=[d.nworld, m.nv], inputs=[m.dof_bodyid, d.cdof, cfrc_total], outputs=[d.qfrc_bias])
   _record_cfrc_adjoint(m, d, cfrc_total)
+  wp.launch(_qfrc_bias, dim=[d.nworld, m.nv], inputs=[m.dof_bodyid, d.cdof, cfrc_total], outputs=[d.qfrc_bias])
   # update d.cfrc_int with accumulated forces for downstream consumers
   d.cfrc_int = cfrc_total
 
@@ -2920,11 +2876,6 @@ def com_vel(m: Model, d: Data):
   wp.launch(_comvel_root, dim=(d.nworld, 6), inputs=[], outputs=[d.cvel])
 
   for body_tree in m.body_tree:
-    cvel_in = (
-      wp.clone(d.cvel)
-      if d.cvel.requires_grad and os.environ.get("MJW_DISABLE_COMVEL_CLONE") != "1"
-      else d.cvel
-    )
     wp.launch(
       _comvel_level,
       dim=(d.nworld, body_tree.size),
@@ -2937,7 +2888,7 @@ def com_vel(m: Model, d: Data):
         body_tree,
         d.qvel,
         d.cdof,
-        cvel_in,
+        d.cvel,
       ],
       outputs=[d.cvel, d.cdof_dot],
     )
