@@ -271,6 +271,132 @@ def _kinematics_branch(
 
 
 @wp.kernel
+def _kinematics_level(
+  # Model:
+  qpos0: wp.array2d[float],
+  body_parentid: wp.array[int],
+  body_mocapid: wp.array[int],
+  body_jntnum: wp.array[int],
+  body_jntadr: wp.array[int],
+  body_pos: wp.array2d[wp.vec3],
+  body_quat: wp.array2d[wp.quat],
+  jnt_type: wp.array[int],
+  jnt_qposadr: wp.array[int],
+  jnt_pos: wp.array2d[wp.vec3],
+  jnt_axis: wp.array2d[wp.vec3],
+  # In:
+  body_tree_: wp.array[int],
+  # Data in:
+  qpos_in: wp.array2d[float],
+  mocap_pos_in: wp.array2d[wp.vec3],
+  mocap_quat_in: wp.array2d[wp.quat],
+  # Data out:
+  xpos_out: wp.array2d[wp.vec3],
+  xquat_out: wp.array2d[wp.quat],
+  xanchor_out: wp.array2d[wp.vec3],
+  xaxis_out: wp.array2d[wp.vec3],
+):
+  worldid, nodeid = wp.tid()
+  bodyid = body_tree_[nodeid]
+  pid = body_parentid[bodyid]
+  jntadr = body_jntadr[bodyid]
+  jntnum = body_jntnum[bodyid]
+
+  is_free = int(0)
+  if jntnum == 1:
+    jnt_type_ = jnt_type[jntadr]
+    if jnt_type_ == JointType.FREE:
+      is_free = int(1)
+
+  if is_free == int(1):
+    return
+
+  jnt_pos_id = worldid % jnt_pos.shape[0]
+  mocapid = body_mocapid[bodyid]
+  if mocapid >= 0:
+    xpos = mocap_pos_in[worldid, mocapid]
+    xquat = mocap_quat_in[worldid, mocapid]
+  else:
+    xpos = body_pos[worldid % body_pos.shape[0], bodyid]
+    xquat = body_quat[worldid % body_quat.shape[0], bodyid]
+
+  if pid >= 0:
+    xpos = math.rot_vec_quat(xpos, xquat_out[worldid, pid]) + xpos_out[worldid, pid]
+    xquat = math.mul_quat(xquat_out[worldid, pid], xquat)
+
+  qpos = qpos_in[worldid]
+
+  if jntnum >= 1:
+    xpos, xquat = _process_joint(
+      xpos,
+      xquat,
+      jntadr,
+      jnt_pos_id,
+      worldid,
+      qpos0,
+      jnt_type,
+      jnt_qposadr,
+      jnt_pos,
+      jnt_axis,
+      qpos,
+      xanchor_out,
+      xaxis_out,
+    )
+  if jntnum >= 2:
+    xpos, xquat = _process_joint(
+      xpos,
+      xquat,
+      jntadr + 1,
+      jnt_pos_id,
+      worldid,
+      qpos0,
+      jnt_type,
+      jnt_qposadr,
+      jnt_pos,
+      jnt_axis,
+      qpos,
+      xanchor_out,
+      xaxis_out,
+    )
+  if jntnum >= 3:
+    xpos, xquat = _process_joint(
+      xpos,
+      xquat,
+      jntadr + 2,
+      jnt_pos_id,
+      worldid,
+      qpos0,
+      jnt_type,
+      jnt_qposadr,
+      jnt_pos,
+      jnt_axis,
+      qpos,
+      xanchor_out,
+      xaxis_out,
+    )
+  if jntnum >= 4:
+    xpos, xquat = _process_joint(
+      xpos,
+      xquat,
+      jntadr + 3,
+      jnt_pos_id,
+      worldid,
+      qpos0,
+      jnt_type,
+      jnt_qposadr,
+      jnt_pos,
+      jnt_axis,
+      qpos,
+      xanchor_out,
+      xaxis_out,
+    )
+
+  xquat = wp.normalize(xquat)
+  xpos_out[worldid, bodyid] = xpos
+  xquat_out[worldid, bodyid] = xquat
+
+
+@wp.kernel
 def _compute_body_inertial_frames(
   # Model:
   body_ipos: wp.array2d[wp.vec3],
@@ -516,29 +642,54 @@ def kinematics(m: Model, d: Data):
       outputs=[d.xpos, d.xquat, d.xanchor, d.xaxis],
     )
 
-  wp.launch(
-    _kinematics_branch,
-    dim=(d.nworld, m.nbranch),
-    inputs=[
-      m.qpos0,
-      m.body_parentid,
-      m.body_mocapid,
-      m.body_jntnum,
-      m.body_jntadr,
-      m.body_pos,
-      m.body_quat,
-      m.jnt_type,
-      m.jnt_qposadr,
-      m.jnt_pos,
-      m.jnt_axis,
-      m.body_branches,
-      m.body_branch_start,
-      d.qpos,
-      d.mocap_pos,
-      d.mocap_quat,
-    ],
-    outputs=[d.xpos, d.xquat, d.xanchor, d.xaxis],
-  )
+  if d.qpos.requires_grad:
+    for body_tree in m.body_tree:
+      wp.launch(
+        _kinematics_level,
+        dim=(d.nworld, body_tree.size),
+        inputs=[
+          m.qpos0,
+          m.body_parentid,
+          m.body_mocapid,
+          m.body_jntnum,
+          m.body_jntadr,
+          m.body_pos,
+          m.body_quat,
+          m.jnt_type,
+          m.jnt_qposadr,
+          m.jnt_pos,
+          m.jnt_axis,
+          body_tree,
+          d.qpos,
+          d.mocap_pos,
+          d.mocap_quat,
+        ],
+        outputs=[d.xpos, d.xquat, d.xanchor, d.xaxis],
+      )
+  else:
+    wp.launch(
+      _kinematics_branch,
+      dim=(d.nworld, m.nbranch),
+      inputs=[
+        m.qpos0,
+        m.body_parentid,
+        m.body_mocapid,
+        m.body_jntnum,
+        m.body_jntadr,
+        m.body_pos,
+        m.body_quat,
+        m.jnt_type,
+        m.jnt_qposadr,
+        m.jnt_pos,
+        m.jnt_axis,
+        m.body_branches,
+        m.body_branch_start,
+        d.qpos,
+        d.mocap_pos,
+        d.mocap_quat,
+      ],
+      outputs=[d.xpos, d.xquat, d.xanchor, d.xaxis],
+    )
 
   wp.launch(
     _compute_body_matrices,
