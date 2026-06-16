@@ -521,7 +521,7 @@ def solve_m_island(
       )
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _apply_ft(
   # Model:
   nbody: int,
@@ -566,6 +566,60 @@ def _apply_ft(
     qfrc_out[worldid, dofid] = accumul
 
 
+@wp.kernel
+def _apply_ft_vjp(
+  # Model:
+  nbody: int,
+  body_parentid: wp.array[int],
+  body_rootid: wp.array[int],
+  dof_bodyid: wp.array[int],
+  # Data in:
+  xipos_in: wp.array2d[wp.vec3],
+  subtree_com_in: wp.array2d[wp.vec3],
+  cdof_in: wp.array2d[wp.spatial_vector],
+  qfrc_grad_in: wp.array2d[float],
+  # Out:
+  ft_grad_out: wp.array2d[wp.spatial_vector],
+):
+  worldid, dofid = wp.tid()
+  cdof = cdof_in[worldid, dofid]
+  rotational_cdof = wp.vec3(cdof[0], cdof[1], cdof[2])
+  jac = wp.spatial_vector(cdof[3], cdof[4], cdof[5], cdof[0], cdof[1], cdof[2])
+
+  dofbodyid = dof_bodyid[dofid]
+  qfrc_grad = qfrc_grad_in[worldid, dofid]
+  if qfrc_grad == 0.0:
+    return
+
+  for bodyid in range(dofbodyid, nbody):
+    parentid = bodyid
+    while parentid != 0 and parentid != dofbodyid:
+      parentid = body_parentid[parentid]
+    if parentid == 0:
+      continue
+
+    offset = xipos_in[worldid, bodyid] - subtree_com_in[worldid, body_rootid[bodyid]]
+    cross_term = wp.cross(rotational_cdof, offset)
+    ft_grad = wp.spatial_vector(
+      (jac[0] + cross_term[0]) * qfrc_grad,
+      (jac[1] + cross_term[1]) * qfrc_grad,
+      (jac[2] + cross_term[2]) * qfrc_grad,
+      jac[3] * qfrc_grad,
+      jac[4] * qfrc_grad,
+      jac[5] * qfrc_grad,
+    )
+    wp.atomic_add(ft_grad_out[worldid], bodyid, ft_grad)
+
+
+def _ensure_array_grad(arr):
+  if not hasattr(arr, "grad") or arr.grad is None:
+    arr.grad = wp.zeros_like(arr)
+    tape = wp._src.context.runtime.tape
+    if tape is not None:
+      tape.gradients[arr] = arr.grad
+  return arr.grad
+
+
 def apply_ft(m: Model, d: Data, ft: wp.array2d[wp.spatial_vector], qfrc: wp.array2d[float], flg_add: bool):
   wp.launch(
     kernel=_apply_ft,
@@ -573,6 +627,34 @@ def apply_ft(m: Model, d: Data, ft: wp.array2d[wp.spatial_vector], qfrc: wp.arra
     inputs=[m.nbody, m.body_parentid, m.body_rootid, m.dof_bodyid, d.xipos, d.subtree_com, d.cdof, ft, flg_add],
     outputs=[qfrc],
   )
+  tape = wp._src.context.runtime.tape
+  if tape is None or not getattr(ft, "requires_grad", False) or not getattr(qfrc, "requires_grad", False):
+    return
+
+  xipos_ref = d.xipos
+  subtree_com_ref = d.subtree_com
+  cdof_ref = d.cdof
+
+  def _adjoint(
+    m=m,
+    d=d,
+    ft_arr=ft,
+    qfrc_arr=qfrc,
+    xipos=xipos_ref,
+    subtree_com=subtree_com_ref,
+    cdof=cdof_ref,
+  ):
+    if qfrc_arr.grad is None:
+      return
+    ft_grad = _ensure_array_grad(ft_arr)
+    wp.launch(
+      _apply_ft_vjp,
+      dim=(d.nworld, m.nv),
+      inputs=[m.nbody, m.body_parentid, m.body_rootid, m.dof_bodyid, xipos, subtree_com, cdof, qfrc_arr.grad],
+      outputs=[ft_grad],
+    )
+
+  tape.record_func(_adjoint, [qfrc, ft, xipos_ref, subtree_com_ref, cdof_ref])
 
 
 @event_scope

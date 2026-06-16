@@ -17,11 +17,42 @@ from mujoco_warp._src import types
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_factorize_solve_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_solve_func
 from mujoco_warp._src.collision_smooth import compute_k_imp
+from mujoco_warp._src.types import DisableBit
 from mujoco_warp._src.warp_util import cache_kernel
 
 # ---------------------------------------------------------------------------
 # Phase 3: efc-level gradient kernels for collision chain
 # ---------------------------------------------------------------------------
+
+
+def _ensure_array_grad(arr):
+  if not hasattr(arr, "grad") or arr.grad is None:
+    arr.grad = wp.zeros_like(arr)
+    tape = wp._src.context.runtime.tape
+    if tape is not None:
+      tape.gradients[arr] = arr.grad
+  return arr.grad
+
+
+def _accumulate_qfrc_smooth_vjp(m: types.Model, d: types.Data, qfrc_smooth_ref, adj_qacc_smooth):
+  if qfrc_smooth_ref is None:
+    return
+
+  from mujoco_warp._src import smooth
+
+  qfrc_grad = _ensure_array_grad(qfrc_smooth_ref)
+  contrib = wp.zeros_like(qfrc_smooth_ref)
+  smooth.solve_m(m, d, contrib, adj_qacc_smooth)
+  if os.environ.get("MJW_DEBUG_ADJOINT", "0") == "2":
+    import numpy as np
+
+    print(f"[adjoint:qfrc_vjp] |contrib|={np.linalg.norm(contrib.numpy()):.6e}")
+  wp.launch(
+    _accumulate_grad_kernel,
+    dim=(d.nworld, m.nv),
+    inputs=[contrib],
+    outputs=[qfrc_grad],
+  )
 
 
 @wp.kernel
@@ -31,21 +62,34 @@ def _efc_J_grad_kernel(
   # Data in:
   nefc_in: wp.array[int],
   efc_force_in: wp.array2d[float],
+  efc_state_in: wp.array2d[int],
+  efc_J_in: wp.array3d[float],
+  efc_D_in: wp.array2d[float],
   njmax_in: int,
   # In:
   v_in: wp.array2d[float],
+  qacc_in: wp.array2d[float],
   # Out:
   efc_J_grad_out: wp.array3d[float],
 ):
-  """Compute adj_efc_J[i, j] = v[j] * efc_force[i].
+  """Compute adj_efc_J for active quadratic rows.
 
   From KKT: F(qacc) = M*qacc - qfrc_smooth - J^T*f = 0
-  The derivative of J^T*f w.r.t. J[i,j] is f[i] * delta, and the
-  adjoint vector v gives the sensitivity: adj_J[i,j] = v[j] * f[i].
+  and active quadratic constraints use f = -D * (J*qacc - aref).
+
+  Therefore J has two contributions:
+    d(J^T f):           v[j] * f[i]
+    df/dJ through Jqacc: -D[i] * (J[i] @ v) * qacc[j]
   """
   worldid, efcid, dofid = wp.tid()
   if efcid < nefc_in[worldid] and dofid < nv:
-    efc_J_grad_out[worldid, efcid, dofid] = v_in[worldid, dofid] * efc_force_in[worldid, efcid]
+    grad = v_in[worldid, dofid] * efc_force_in[worldid, efcid]
+    if efc_state_in[worldid, efcid] == types.ConstraintState.QUADRATIC.value:
+      jv = float(0.0)
+      for j in range(nv):
+        jv += efc_J_in[worldid, efcid, j] * v_in[worldid, j]
+      grad += efc_D_in[worldid, efcid] * jv * qacc_in[worldid, dofid]
+    efc_J_grad_out[worldid, efcid, dofid] += grad
 
 
 @wp.kernel
@@ -58,9 +102,11 @@ def _efc_pos_grad_kernel(
   contact_includemargin_in: wp.array[float],
   contact_solref_in: wp.array[wp.vec2],
   contact_solimp_in: wp.array[types.vec5],
+  contact_dim_in: wp.array[int],
   contact_efc_address_in: wp.array2d[int],
   contact_worldid_in: wp.array[int],
   contact_type_in: wp.array[int],
+  efc_type_in: wp.array2d[int],
   nacon_in: wp.array[int],
   # In:
   efc_aref_grad_in: wp.array2d[float],
@@ -73,17 +119,29 @@ def _efc_pos_grad_kernel(
   So adj_efc_pos = adj_efc_aref * (-k * imp).
   We iterate over contacts and their first dimension (normal direction).
   """
-  conid = wp.tid()
+  conid, dimid = wp.tid()
   if conid >= nacon_in[0]:
     return
   if not (contact_type_in[conid] & 1):  # ContactType.CONSTRAINT
     return
 
-  efcid = contact_efc_address_in[conid, 0]
+  condim = contact_dim_in[conid]
+  if condim == 1:
+    if dimid > 0:
+      return
+  elif dimid >= 2 * (condim - 1):
+    return
+
+  efcid = contact_efc_address_in[conid, dimid]
   if efcid < 0:
     return
 
   worldid = contact_worldid_in[conid]
+  # Elliptic tangential rows have pos_aref=0 in the forward assembly, so only
+  # the normal row carries penetration-position sensitivity.
+  if efc_type_in[worldid, efcid] == types.ConstraintType.CONTACT_ELLIPTIC and dimid > 0:
+    return
+
   timestep = opt_timestep[worldid % opt_timestep.shape[0]]
 
   solref = contact_solref_in[conid]
@@ -93,11 +151,157 @@ def _efc_pos_grad_kernel(
 
   k_imp = compute_k_imp(opt_disableflags, solref, solimp, pos_val, timestep)
 
-  # d(aref)/d(pos) = -k * imp
-  daref_dpos = -k_imp[0] * k_imp[1]
+  dmin = wp.clamp(solimp[0], types.MJ_MINIMP, types.MJ_MAXIMP)
+  dmax = wp.clamp(solimp[1], types.MJ_MINIMP, types.MJ_MAXIMP)
+  width = wp.max(types.MJ_MINVAL, solimp[2])
+  mid = wp.clamp(solimp[3], types.MJ_MINIMP, types.MJ_MAXIMP)
+  power = wp.max(1.0, solimp[4])
+
+  imp_x = wp.abs(pos_val) / width
+  imp_slope_a = power * wp.pow(imp_x, power - 1.0) / wp.pow(mid, power - 1.0)
+  imp_slope_b = power * wp.pow(1.0 - imp_x, power - 1.0) / wp.pow(1.0 - mid, power - 1.0)
+  imp_slope_x = wp.where(imp_x < mid, imp_slope_a, imp_slope_b)
+  imp_slope_x = wp.where(imp_x > 1.0, 0.0, imp_slope_x)
+  pos_sign = wp.where(pos_val > 0.0, 1.0, wp.where(pos_val < 0.0, -1.0, 0.0))
+  dimp_dpos = (dmax - dmin) * imp_slope_x * pos_sign / width
+
+  # aref = -k * imp(pos) * pos - b * vel
+  daref_dpos = -k_imp[0] * (k_imp[1] + pos_val * dimp_dpos)
 
   adj_aref = efc_aref_grad_in[worldid, efcid]
-  efc_pos_grad_out[worldid, efcid] = adj_aref * daref_dpos
+  wp.atomic_add(efc_pos_grad_out, worldid, efcid, adj_aref * daref_dpos)
+
+
+@wp.kernel
+def _efc_vel_grad_kernel(
+  # Model:
+  nv: int,
+  opt_timestep: wp.array[float],
+  opt_disableflags: int,
+  # Contact in:
+  contact_dim_in: wp.array[int],
+  contact_efc_address_in: wp.array2d[int],
+  contact_worldid_in: wp.array[int],
+  contact_type_in: wp.array[int],
+  contact_solref_in: wp.array[wp.vec2],
+  contact_solimp_in: wp.array[types.vec5],
+  nacon_in: wp.array[int],
+  # EFC/Data in:
+  efc_aref_grad_in: wp.array2d[float],
+  efc_J_in: wp.array3d[float],
+  qvel_in: wp.array2d[float],
+  # Out:
+  qvel_grad_out: wp.array2d[float],
+  efc_J_grad_out: wp.array3d[float],
+):
+  """Propagate adj_efc_aref through aref = ... - b * (J qvel)."""
+  conid, dimid = wp.tid()
+  if conid >= nacon_in[0]:
+    return
+  if not (contact_type_in[conid] & 1):  # ContactType.CONSTRAINT
+    return
+
+  condim = contact_dim_in[conid]
+  if condim == 1 and dimid > 0:
+    return
+  elif condim > 1 and dimid >= 2 * (condim - 1):
+    return
+
+  efcid = contact_efc_address_in[conid, dimid]
+  if efcid < 0:
+    return
+
+  worldid = contact_worldid_in[conid]
+  adj_aref = efc_aref_grad_in[worldid, efcid]
+  if adj_aref == 0.0:
+    return
+
+  timestep = opt_timestep[worldid % opt_timestep.shape[0]]
+  solref = contact_solref_in[conid]
+  solimp = contact_solimp_in[conid]
+  dmax = wp.clamp(solimp[1], types.MJ_MINIMP, types.MJ_MAXIMP)
+  timeconst = solref[0]
+  if not (opt_disableflags & DisableBit.REFSAFE):
+    timeconst = wp.max(timeconst, 2.0 * timestep)
+  b = 2.0 / (dmax * timeconst)
+  b = wp.where(solref[1] <= 0.0, -solref[1] / dmax, b)
+  adj_vel = -b * adj_aref
+
+  for dofid in range(nv):
+    J = efc_J_in[worldid, efcid, dofid]
+    if J != 0.0:
+      wp.atomic_add(qvel_grad_out, worldid, dofid, adj_vel * J)
+      wp.atomic_add(efc_J_grad_out, worldid, efcid, dofid, adj_vel * qvel_in[worldid, dofid])
+
+
+@wp.kernel
+def _limit_efc_grad_kernel(
+  # Model:
+  nv: int,
+  is_sparse: bool,
+  # Data in:
+  nefc_in: wp.array[int],
+  ne_in: wp.array[int],
+  nf_in: wp.array[int],
+  efc_type_in: wp.array2d[int],
+  efc_state_in: wp.array2d[int],
+  efc_J_rownnz_in: wp.array2d[int],
+  efc_J_rowadr_in: wp.array2d[int],
+  efc_J_colind_in: wp.array3d[int],
+  efc_J_in: wp.array3d[float],
+  efc_D_in: wp.array2d[float],
+  solver_Jaref_in: wp.array2d[float],
+  njmax_in: int,
+  # In:
+  v_in: wp.array2d[float],
+  # Out:
+  efc_aref_contact_grad_out: wp.array2d[float],
+  efc_aref_auto_grad_out: wp.array2d[float],
+  efc_D_grad_out: wp.array2d[float],
+):
+  worldid, efcid = wp.tid()
+
+  if efcid >= nefc_in[worldid] or efcid >= njmax_in:
+    return
+
+  efc_type = efc_type_in[worldid, efcid]
+  is_limit = efc_type == types.ConstraintType.LIMIT_JOINT
+  is_contact = (
+    efc_type == types.ConstraintType.CONTACT_FRICTIONLESS
+    or efc_type == types.ConstraintType.CONTACT_PYRAMIDAL
+    or efc_type == types.ConstraintType.CONTACT_ELLIPTIC
+  )
+  if not (is_limit or is_contact):
+    return
+
+  if efc_state_in[worldid, efcid] != types.ConstraintState.QUADRATIC.value:
+    return
+
+  # Equality/friction rows have different force laws.  This kernel handles
+  # active one-sided limit/contact rows, where force = -D * (J*qacc - aref).
+  if efcid < ne_in[worldid] + nf_in[worldid]:
+    return
+
+  jv = float(0.0)
+  if is_sparse:
+    rownnz = efc_J_rownnz_in[worldid, efcid]
+    rowadr = efc_J_rowadr_in[worldid, efcid]
+    for k in range(rownnz):
+      sparseid = rowadr + k
+      colind = efc_J_colind_in[worldid, 0, sparseid]
+      jv += efc_J_in[worldid, 0, sparseid] * v_in[worldid, colind]
+  else:
+    for dofid in range(nv):
+      jv += efc_J_in[worldid, efcid, dofid] * v_in[worldid, dofid]
+
+  D = efc_D_in[worldid, efcid]
+  Jaref = solver_Jaref_in[worldid, efcid]
+  aref_grad = D * jv
+  if is_contact:
+    efc_aref_contact_grad_out[worldid, efcid] += aref_grad
+  else:
+    efc_aref_auto_grad_out[worldid, efcid] += aref_grad
+  efc_D_grad_out[worldid, efcid] += -Jaref * jv
 
 
 # ---------------------------------------------------------------------------
@@ -727,7 +931,14 @@ def _solve_hessian_system(m: types.Model, d: types.Data, b, out, H=None):
       )
 
 
-def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None, qacc_smooth_ref=None):
+def solver_implicit_adjoint(
+  m: types.Model,
+  d: types.Data,
+  qacc_array=None,
+  qacc_smooth_ref=None,
+  qfrc_smooth_ref=None,
+  qvel_ref=None,
+):
   """Implicit differentiation adjoint for constraint solver.
 
   Called during tape backward. Reads qacc_array.grad (set by downstream
@@ -745,6 +956,11 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None, qacc
                      accumulated adjoint. Captured at record time for
                      correct gradient isolation when intermediate arrays
                      are cloned between substeps. Defaults to d.qacc_smooth.
+    qfrc_smooth_ref: The qfrc_smooth array whose .grad receives the
+                     acceleration force-side VJP.
+    qvel_ref: The pre-integrator qvel array used during constraint assembly.
+              ``step()`` replaces d.qvel during integration, so this must be
+              captured at record time.
   """
   nv = m.nv
   if nv == 0:
@@ -755,6 +971,10 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None, qacc
 
   if qacc_smooth_ref is None:
     qacc_smooth_ref = d.qacc_smooth
+  if qfrc_smooth_ref is None:
+    qfrc_smooth_ref = d.qfrc_smooth
+  if qvel_ref is None:
+    qvel_ref = d.qvel
 
   adj_qacc = qacc_array.grad
   if adj_qacc is None:
@@ -787,22 +1007,26 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None, qacc
 
   if d.njmax == 0:
     # Solver was identity (qacc = qacc_smooth), accumulate adjoint through
+    qacc_smooth_grad = _ensure_array_grad(qacc_smooth_ref)
     wp.launch(
       _accumulate_grad_kernel,
       dim=(d.nworld, nv),
       inputs=[adj_qacc],
-      outputs=[qacc_smooth_ref.grad],
+      outputs=[qacc_smooth_grad],
     )
+    _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, adj_qacc)
     return
 
   if m.opt.solver != types.SolverType.NEWTON:
     # CG solver: no Hessian stored, fall back to identity
+    qacc_smooth_grad = _ensure_array_grad(qacc_smooth_ref)
     wp.launch(
       _accumulate_grad_kernel,
       dim=(d.nworld, nv),
       inputs=[adj_qacc],
-      outputs=[qacc_smooth_ref.grad],
+      outputs=[qacc_smooth_grad],
     )
+    _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, adj_qacc)
     return
 
   # Solve H * v = adj_qacc
@@ -812,35 +1036,93 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None, qacc
   # adj_qacc_smooth += M * v  (accumulate, not overwrite)
   tmp = wp.zeros((d.nworld, m.nv_pad), dtype=float)
   support.mul_m(m, d, tmp, v)
+  qacc_smooth_grad = _ensure_array_grad(qacc_smooth_ref)
   wp.launch(
     _accumulate_grad_kernel,
     dim=(d.nworld, nv),
     inputs=[tmp],
-    outputs=[qacc_smooth_ref.grad],
+    outputs=[qacc_smooth_grad],
   )
+  _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, tmp)
 
   # Phase 3: compute efc-level gradients for collision chain
-  _efc_level_gradients(m, d, v)
+  qacc_for_grad = qacc_array if qacc_array is not None else d.qacc
+  _efc_level_gradients(m, d, v, qacc_for_grad, qvel_ref)
 
 
-def _efc_level_gradients(m: types.Model, d: types.Data, v):
+def _efc_level_gradients(m: types.Model, d: types.Data, v, qacc, qvel_ref=None):
   """Compute efc-level gradients for collision chain (shared by both adjoints)."""
+  def _ensure_grad(arr):
+    if not hasattr(arr, "grad") or arr.grad is None:
+      arr.grad = wp.zeros_like(arr)
+      tape = wp._src.context.runtime.tape
+      if tape is not None:
+        tape.gradients[arr] = arr.grad
+    return arr.grad
+
   if d.njmax > 0:
+    if qvel_ref is None:
+      qvel_ref = d.qvel
+    contact_aref_grad = None
     efc_J = d.efc.J
-    if hasattr(efc_J, "grad") and efc_J.grad is not None:
+    if os.environ.get("MJW_DISABLE_EFC_J_VJP") != "1" and hasattr(efc_J, "grad") and efc_J.grad is not None:
       wp.launch(
         _efc_J_grad_kernel,
         dim=(d.nworld, d.njmax_pad, m.nv_pad),
-        inputs=[m.nv, d.nefc, d.efc.force, d.njmax, v],
+        inputs=[m.nv, d.nefc, d.efc.force, d.efc.state, d.efc.J, d.efc.D, d.njmax, v, qacc],
         outputs=[efc_J.grad],
+      )
+
+    if os.environ.get("MJW_DISABLE_EFC_LIMIT_VJP") != "1" and d.solver_Jaref.shape[0] > 0:
+      if os.environ.get("MJW_DISABLE_EFC_AREF_VJP") == "1":
+        contact_aref_grad = wp.zeros_like(d.efc.aref)
+        auto_aref_grad_out = wp.zeros_like(d.efc.aref)
+      else:
+        # Contact aref gradients use a manual VJP below.  Writing them to
+        # d.efc.aref.grad would also trigger the generated backward for
+        # smooth_contact_to_efc, which currently over-injects angular terms.
+        contact_aref_grad = wp.zeros_like(d.efc.aref)
+        auto_aref_grad_out = _ensure_grad(d.efc.aref)
+      if os.environ.get("MJW_DISABLE_EFC_D_VJP") == "1":
+        D_grad_out = wp.zeros_like(d.efc.D)
+      else:
+        D_grad_out = _ensure_grad(d.efc.D)
+      wp.launch(
+        _limit_efc_grad_kernel,
+        dim=(d.nworld, d.njmax),
+        inputs=[
+          m.nv,
+          m.is_sparse,
+          d.nefc,
+          d.ne,
+          d.nf,
+          d.efc.type,
+          d.efc.state,
+          d.efc.J_rownnz,
+          d.efc.J_rowadr,
+          d.efc.J_colind,
+          d.efc.J,
+          d.efc.D,
+          d.solver_Jaref,
+          d.njmax,
+          v,
+        ],
+        outputs=[contact_aref_grad, auto_aref_grad_out, D_grad_out],
       )
 
     efc_aref = d.efc.aref
     efc_pos = d.efc.pos
-    if hasattr(efc_aref, "grad") and efc_aref.grad is not None and hasattr(efc_pos, "grad") and efc_pos.grad is not None:
+    if contact_aref_grad is None and hasattr(efc_aref, "grad"):
+      contact_aref_grad = efc_aref.grad
+    if (
+      os.environ.get("MJW_DISABLE_EFC_POS_VJP") != "1"
+      and contact_aref_grad is not None
+      and hasattr(efc_pos, "grad")
+      and efc_pos.grad is not None
+    ):
       wp.launch(
         _efc_pos_grad_kernel,
-        dim=d.naconmax,
+        dim=(d.naconmax, 10),
         inputs=[
           m.opt.timestep,
           m.opt.disableflags,
@@ -848,13 +1130,46 @@ def _efc_level_gradients(m: types.Model, d: types.Data, v):
           d.contact.includemargin,
           d.contact.solref,
           d.contact.solimp,
+          d.contact.dim,
           d.contact.efc_address,
           d.contact.worldid,
           d.contact.type,
+          d.efc.type,
           d.nacon,
-          efc_aref.grad,
+          contact_aref_grad,
         ],
         outputs=[efc_pos.grad],
+      )
+
+    if os.environ.get("MJW_DISABLE_EFC_VEL_VJP") != "1" and contact_aref_grad is not None:
+      qvel_grad = _ensure_grad(qvel_ref)
+      _ensure_grad(d.efc.J)
+      if os.environ.get("MJW_DEBUG_ADJOINT", "0") == "2":
+        print(
+          "[adjoint:efc_vel] "
+          f"qvel={qvel_ref.shape} qvel_grad={qvel_grad.shape} "
+          f"efc_J={d.efc.J.shape} efc_J_grad={d.efc.J.grad.shape} "
+          f"aref_grad={efc_aref.grad.shape} naconmax={d.naconmax}"
+        )
+      wp.launch(
+        _efc_vel_grad_kernel,
+        dim=(d.naconmax, 10),
+        inputs=[
+          m.nv,
+          m.opt.timestep,
+          m.opt.disableflags,
+          d.contact.dim,
+          d.contact.efc_address,
+          d.contact.worldid,
+          d.contact.type,
+          d.contact.solref,
+          d.contact.solimp,
+          d.nacon,
+          contact_aref_grad,
+          d.efc.J,
+          qvel_ref,
+        ],
+        outputs=[qvel_grad, d.efc.J.grad],
       )
 
 
@@ -868,6 +1183,8 @@ def solver_smooth_adjoint(
   d: types.Data,
   qacc_array=None,
   qacc_smooth_ref=None,
+  qfrc_smooth_ref=None,
+  qvel_ref=None,
 ):
   """Smooth constraint adjoint for friction gradient signal.
 
@@ -895,6 +1212,10 @@ def solver_smooth_adjoint(
 
   if qacc_smooth_ref is None:
     qacc_smooth_ref = d.qacc_smooth
+  if qfrc_smooth_ref is None:
+    qfrc_smooth_ref = d.qfrc_smooth
+  if qvel_ref is None:
+    qvel_ref = d.qvel
 
   adj_qacc = qacc_array.grad
   if adj_qacc is None:
@@ -908,21 +1229,25 @@ def solver_smooth_adjoint(
     print(f"[smooth_adjoint] |adj_qacc|={adj_norm:.6e}, njmax={d.njmax}")
 
   if d.njmax == 0:
+    qacc_smooth_grad = _ensure_array_grad(qacc_smooth_ref)
     wp.launch(
       _accumulate_grad_kernel,
       dim=(d.nworld, nv),
       inputs=[adj_qacc],
-      outputs=[qacc_smooth_ref.grad],
+      outputs=[qacc_smooth_grad],
     )
+    _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, adj_qacc)
     return
 
   if m.opt.solver != types.SolverType.NEWTON:
+    qacc_smooth_grad = _ensure_array_grad(qacc_smooth_ref)
     wp.launch(
       _accumulate_grad_kernel,
       dim=(d.nworld, nv),
       inputs=[adj_qacc],
-      outputs=[qacc_smooth_ref.grad],
+      outputs=[qacc_smooth_grad],
     )
+    _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, adj_qacc)
     return
 
   # Read smooth adjoint parameters from Data
@@ -1111,12 +1436,15 @@ def solver_smooth_adjoint(
   # adj_qacc_smooth += M * v
   tmp = wp.zeros((d.nworld, m.nv_pad), dtype=float)
   support.mul_m(m, d, tmp, v)
+  qacc_smooth_grad = _ensure_array_grad(qacc_smooth_ref)
   wp.launch(
     _accumulate_grad_kernel,
     dim=(d.nworld, nv),
     inputs=[tmp],
-    outputs=[qacc_smooth_ref.grad],
+    outputs=[qacc_smooth_grad],
   )
+  _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, tmp)
 
   # Phase 3: efc-level gradients for collision chain
-  _efc_level_gradients(m, d, v)
+  qacc_for_grad = qacc_array if qacc_array is not None else d.qacc
+  _efc_level_gradients(m, d, v, qacc_for_grad, qvel_ref)

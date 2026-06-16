@@ -46,7 +46,9 @@ from mujoco_warp._src.types import IntegratorType
 from mujoco_warp._src.types import JointType
 from mujoco_warp._src.types import Model
 from mujoco_warp._src.types import TileSet
+from mujoco_warp._src.types import ConstraintType
 from mujoco_warp._src.types import TrnType
+from mujoco_warp._src.types import vec5
 from mujoco_warp._src.types import vec10f
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
@@ -54,6 +56,187 @@ from mujoco_warp._src.warp_util import event_scope
 # Backward-enabled kernels generate slower forward code, so AD compilation is
 # opt-in: off by default, enabled by mjw.enable_ad() / make_diff_data().
 wp.set_module_options({"enable_backward": _ad_flags.ad_enabled()})
+
+
+@wp.func
+def _smooth_efc_row(
+  opt_disableflags: int,
+  worldid: int,
+  timestep: float,
+  efcid: int,
+  pos_aref: float,
+  pos_imp: float,
+  invweight: float,
+  solref: wp.vec2,
+  solimp: vec5,
+  margin: float,
+  vel: float,
+  pos_out: wp.array2d[float],
+  margin_out: wp.array2d[float],
+  D_out: wp.array2d[float],
+  vel_out: wp.array2d[float],
+  aref_out: wp.array2d[float],
+):
+  timeconst = solref[0]
+  dampratio = solref[1]
+  dmin = solimp[0]
+  dmax = solimp[1]
+  width = solimp[2]
+  mid = solimp[3]
+  power = solimp[4]
+
+  if not (opt_disableflags & DisableBit.REFSAFE):
+    timeconst = wp.max(timeconst, 2.0 * timestep)
+
+  dmin = wp.clamp(dmin, types.MJ_MINIMP, types.MJ_MAXIMP)
+  dmax = wp.clamp(dmax, types.MJ_MINIMP, types.MJ_MAXIMP)
+  width = wp.max(types.MJ_MINVAL, width)
+  mid = wp.clamp(mid, types.MJ_MINIMP, types.MJ_MAXIMP)
+  power = wp.max(1.0, power)
+
+  dmax_sq = dmax * dmax
+  k = 1.0 / (dmax_sq * timeconst * timeconst * dampratio * dampratio)
+  b = 2.0 / (dmax * timeconst)
+  k = wp.where(solref[0] <= 0.0, -solref[0] / dmax_sq, k)
+  b = wp.where(solref[1] <= 0.0, -solref[1] / dmax, b)
+
+  imp_x = wp.abs(pos_imp) / width
+  imp_a = (1.0 / wp.pow(mid, power - 1.0)) * wp.pow(imp_x, power)
+  imp_b = 1.0 - (1.0 / wp.pow(1.0 - mid, power - 1.0)) * wp.pow(1.0 - imp_x, power)
+  imp_y = wp.where(imp_x < mid, imp_a, imp_b)
+  imp = dmin + imp_y * (dmax - dmin)
+  imp = wp.clamp(imp, dmin, dmax)
+  imp = wp.where(imp_x > 1.0, dmax, imp)
+
+  D_out[worldid, efcid] = 1.0 / wp.max(invweight * (1.0 - imp) / imp, types.MJ_MINVAL)
+  vel_out[worldid, efcid] = vel
+  aref_out[worldid, efcid] = -k * imp * pos_aref - b * vel
+  pos_out[worldid, efcid] = pos_aref + margin
+  margin_out[worldid, efcid] = margin
+
+
+@wp.kernel
+def _smooth_slide_hinge_limit_to_efc(
+  nv: int,
+  opt_timestep: wp.array[float],
+  opt_disableflags: int,
+  jnt_type: wp.array[int],
+  jnt_qposadr: wp.array[int],
+  jnt_dofadr: wp.array[int],
+  jnt_solref: wp.array2d[wp.vec2],
+  jnt_solimp: wp.array2d[vec5],
+  jnt_range: wp.array2d[wp.vec2],
+  jnt_margin: wp.array2d[float],
+  dof_invweight0: wp.array2d[float],
+  qpos_in: wp.array2d[float],
+  qvel_in: wp.array2d[float],
+  nefc_in: wp.array[int],
+  efc_type_in: wp.array2d[int],
+  efc_id_in: wp.array2d[int],
+  is_sparse: bool,
+  efc_J_rownnz_out: wp.array2d[int],
+  efc_J_rowadr_out: wp.array2d[int],
+  efc_J_colind_out: wp.array3d[int],
+  efc_J_out: wp.array3d[float],
+  efc_pos_out: wp.array2d[float],
+  efc_margin_out: wp.array2d[float],
+  efc_D_out: wp.array2d[float],
+  efc_vel_out: wp.array2d[float],
+  efc_aref_out: wp.array2d[float],
+):
+  worldid, efcid = wp.tid()
+
+  if efcid >= nefc_in[worldid]:
+    return
+
+  if efc_type_in[worldid, efcid] != ConstraintType.LIMIT_JOINT:
+    return
+
+  jntid = efc_id_in[worldid, efcid]
+  jnttype = jnt_type[jntid]
+  if jnttype != JointType.SLIDE and jnttype != JointType.HINGE:
+    return
+
+  jnt_range_id = worldid % jnt_range.shape[0]
+  jntrange = jnt_range[jnt_range_id, jntid]
+  qpos = qpos_in[worldid, jnt_qposadr[jntid]]
+  jnt_margin_id = worldid % jnt_margin.shape[0]
+  jntmargin = jnt_margin[jnt_margin_id, jntid]
+  dist_min = qpos - jntrange[0]
+  dist_max = jntrange[1] - qpos
+  pos = wp.min(dist_min, dist_max) - jntmargin
+  J = float(dist_min < dist_max) * 2.0 - 1.0
+
+  dofadr = jnt_dofadr[jntid]
+  if is_sparse:
+    efc_J_rownnz_out[worldid, efcid] = 1
+    rowadr = efc_J_rowadr_out[worldid, efcid]
+    efc_J_colind_out[worldid, 0, rowadr] = dofadr
+    efc_J_out[worldid, 0, rowadr] = J
+  else:
+    for i in range(nv):
+      efc_J_out[worldid, efcid, i] = 0.0
+    efc_J_out[worldid, efcid, dofadr] = J
+
+  Jqvel = J * qvel_in[worldid, dofadr]
+  dof_invweight0_id = worldid % dof_invweight0.shape[0]
+  jnt_solref_id = worldid % jnt_solref.shape[0]
+  jnt_solimp_id = worldid % jnt_solimp.shape[0]
+  _smooth_efc_row(
+    opt_disableflags,
+    worldid,
+    opt_timestep[worldid % opt_timestep.shape[0]],
+    efcid,
+    pos,
+    pos,
+    dof_invweight0[dof_invweight0_id, dofadr],
+    jnt_solref[jnt_solref_id, jntid],
+    jnt_solimp[jnt_solimp_id, jntid],
+    jntmargin,
+    Jqvel,
+    efc_pos_out,
+    efc_margin_out,
+    efc_D_out,
+    efc_vel_out,
+    efc_aref_out,
+  )
+
+
+def _smooth_joint_limits_to_efc(m: Model, d: Data):
+  wp.launch(
+    _smooth_slide_hinge_limit_to_efc,
+    dim=(d.nworld, d.njmax),
+    inputs=[
+      m.nv,
+      m.opt.timestep,
+      m.opt.disableflags,
+      m.jnt_type,
+      m.jnt_qposadr,
+      m.jnt_dofadr,
+      m.jnt_solref,
+      m.jnt_solimp,
+      m.jnt_range,
+      m.jnt_margin,
+      m.dof_invweight0,
+      d.qpos,
+      d.qvel,
+      d.nefc,
+      d.efc.type,
+      d.efc.id,
+      m.is_sparse,
+    ],
+    outputs=[
+      d.efc.J_rownnz,
+      d.efc.J_rowadr,
+      d.efc.J_colind,
+      d.efc.J,
+      d.efc.pos,
+      d.efc.margin,
+      d.efc.D,
+      d.efc.vel,
+      d.efc.aref,
+    ],
+  )
 
 
 @wp.kernel
@@ -751,10 +934,12 @@ def fwd_position(m: Model, d: Data, factorize: bool = True):
   constraint.make_constraint(m, d)
 
   # Phase 3 AD: recompute constraint assembly (efc.J, efc.pos) on a
-  # differentiable path from the smooth contact geometry.
+  # differentiable path from smooth contact geometry and active joint limits.
   tape = wp._src.context.runtime.tape
   if tape is not None and d.qpos.requires_grad:
     collision_smooth.smooth_contact_to_efc(m, d)
+    if not (m.opt.disableflags & types.DisableBit.LIMIT):
+      _smooth_joint_limits_to_efc(m, d)
 
   if sleep_enabled:
     if m.neq > 0:
@@ -1515,19 +1700,12 @@ def _record_fwd_accel_adjoint(m: Model, d: Data):
       if adj_qacc_smooth is None:
         return
 
-      # qfrc_smooth.grad += M_inv * qacc_smooth.grad
+      # The force-side VJP qfrc_smooth.grad += M^-1 * qacc_smooth.grad is
+      # accumulated inside the solver adjoint, after that adjoint has formed
+      # the qacc_smooth contribution.  This callback keeps only the mass-matrix
+      # VJP that uses the same solved vector.
       tmp = wp.zeros_like(qfrc_smooth)
       smooth.solve_m(m, d, tmp, adj_qacc_smooth)
-      if qfrc_smooth.grad is None:
-        qfrc_smooth.grad = tmp
-        tape.gradients[qfrc_smooth] = qfrc_smooth.grad
-      else:
-        wp.launch(
-          _accumulate_grad_kernel,
-          dim=(d.nworld, m.nv),
-          inputs=[tmp],
-          outputs=[qfrc_smooth.grad],
-        )
 
       if not m.is_sparse:
         M_grad_contrib = wp.zeros_like(M)
@@ -1568,22 +1746,30 @@ def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
     if qacc_array is None:
       qacc_array = d.qacc
 
-    # Capture qacc_smooth ref at record time for gradient isolation
+    # Capture refs at record time for gradient isolation.  step() replaces
+    # d.qvel during integration, so the solver adjoint must keep the
+    # pre-integrator qvel used by constraint assembly.
     qacc_smooth_ref = d.qacc_smooth
+    qfrc_smooth_ref = d.qfrc_smooth
+    qvel_ref = d.qvel
 
     if getattr(d, "smooth_adjoint", 0):
       from mujoco_warp._src.adjoint import solver_smooth_adjoint
 
       tape.record_func(
-        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref: solver_smooth_adjoint(m, d, qacc_array=qa, qacc_smooth_ref=qs),
-        [qacc_array, qacc_smooth_ref],
+        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref, qf=qfrc_smooth_ref, qv=qvel_ref: solver_smooth_adjoint(
+          m, d, qacc_array=qa, qacc_smooth_ref=qs, qfrc_smooth_ref=qf, qvel_ref=qv
+        ),
+        [qacc_array, qacc_smooth_ref, qfrc_smooth_ref, qvel_ref],
       )
     else:
       from mujoco_warp._src.adjoint import solver_implicit_adjoint
 
       tape.record_func(
-        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref: solver_implicit_adjoint(m, d, qacc_array=qa, qacc_smooth_ref=qs),
-        [qacc_array, qacc_smooth_ref],
+        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref, qf=qfrc_smooth_ref, qv=qvel_ref: solver_implicit_adjoint(
+          m, d, qacc_array=qa, qacc_smooth_ref=qs, qfrc_smooth_ref=qf, qvel_ref=qv
+        ),
+        [qacc_array, qacc_smooth_ref, qfrc_smooth_ref, qvel_ref],
       )
 
 
@@ -1807,6 +1993,57 @@ def _isolate_intermediates_for_ad(m: Model, d: Data):
   d.M = wp.zeros_like(d.M, requires_grad=True)
   d.qLD = wp.zeros_like(d.qLD, requires_grad=True)
   d.qLDiagInv = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+
+  # --- Contacts ---
+  # Contact detection and the differentiable smooth contact recompute overwrite
+  # these buffers every step.  The tape stores array references, so multi-step
+  # BPTT needs unique contact storage per substep just like EFC storage below.
+  d.nacon = wp.zeros_like(d.nacon)
+  d.ncollision = wp.zeros_like(d.ncollision)
+  d.contact.dist = wp.zeros_like(d.contact.dist, requires_grad=True)
+  d.contact.pos = wp.zeros_like(d.contact.pos, requires_grad=True)
+  d.contact.frame = wp.zeros_like(d.contact.frame, requires_grad=True)
+  d.contact.includemargin = wp.zeros_like(d.contact.includemargin)
+  d.contact.friction = wp.zeros_like(d.contact.friction)
+  d.contact.solref = wp.zeros_like(d.contact.solref)
+  d.contact.solreffriction = wp.zeros_like(d.contact.solreffriction)
+  d.contact.solimp = wp.zeros_like(d.contact.solimp)
+  d.contact.dim = wp.zeros_like(d.contact.dim)
+  d.contact.geom = wp.zeros_like(d.contact.geom)
+  d.contact.flex = wp.zeros_like(d.contact.flex)
+  d.contact.elem = wp.zeros_like(d.contact.elem)
+  d.contact.vert = wp.zeros_like(d.contact.vert)
+  d.contact.efc_address = wp.zeros_like(d.contact.efc_address)
+  d.contact.worldid = wp.zeros_like(d.contact.worldid)
+  d.contact.type = wp.zeros_like(d.contact.type)
+  d.contact.geomcollisionid = wp.zeros_like(d.contact.geomcollisionid)
+
+  # --- Constraint rows ---
+  # Constraint assembly and solver state are overwritten each step.  The
+  # custom solver adjoint reads these arrays during backward, so each substep
+  # needs its own copies when gradients are recorded.
+  d.efc.type = wp.zeros_like(d.efc.type)
+  d.efc.id = wp.zeros_like(d.efc.id)
+  d.efc.J_rownnz = wp.zeros_like(d.efc.J_rownnz)
+  d.efc.J_rowadr = wp.zeros_like(d.efc.J_rowadr)
+  d.efc.J_colind = wp.zeros_like(d.efc.J_colind)
+  d.efc.J = wp.zeros_like(d.efc.J, requires_grad=True)
+  d.efc.pos = wp.zeros_like(d.efc.pos, requires_grad=True)
+  d.efc.margin = wp.zeros_like(d.efc.margin, requires_grad=True)
+  d.efc.D = wp.zeros_like(d.efc.D, requires_grad=True)
+  d.efc.vel = wp.zeros_like(d.efc.vel, requires_grad=True)
+  d.efc.aref = wp.zeros_like(d.efc.aref, requires_grad=True)
+  d.efc.frictionloss = wp.zeros_like(d.efc.frictionloss, requires_grad=True)
+  d.efc.force = wp.zeros_like(d.efc.force)
+  d.efc.state = wp.zeros_like(d.efc.state)
+  d.efc.Ma = wp.zeros_like(d.efc.Ma, requires_grad=True)
+  d.efc.Jqvel = wp.zeros_like(d.efc.Jqvel, requires_grad=True)
+  if d.solver_h.shape[1] > 0:
+    d.solver_h = wp.zeros_like(d.solver_h)
+  if d.solver_hfactor.shape[1] > 0:
+    d.solver_hfactor = wp.zeros_like(d.solver_hfactor)
+  if d.solver_Jaref.shape[0] > 0:
+    d.solver_Jaref = wp.zeros_like(d.solver_Jaref)
 
   # --- Geometry / joint kinematics ---
   # Static world geoms are not recomputed in smooth._geom_local_to_global(),
