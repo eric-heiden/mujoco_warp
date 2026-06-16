@@ -1748,28 +1748,29 @@ def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
 
     # Capture refs at record time for gradient isolation.  step() replaces
     # d.qvel during integration, so the solver adjoint must keep the
-    # pre-integrator qvel used by constraint assembly.
+    # pre-integrator qpos/qvel used by constraint assembly.
     qacc_smooth_ref = d.qacc_smooth
     qfrc_smooth_ref = d.qfrc_smooth
+    qpos_ref = d.qpos
     qvel_ref = d.qvel
 
     if getattr(d, "smooth_adjoint", 0):
       from mujoco_warp._src.adjoint import solver_smooth_adjoint
 
       tape.record_func(
-        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref, qf=qfrc_smooth_ref, qv=qvel_ref: solver_smooth_adjoint(
-          m, d, qacc_array=qa, qacc_smooth_ref=qs, qfrc_smooth_ref=qf, qvel_ref=qv
+        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref, qf=qfrc_smooth_ref, qp=qpos_ref, qv=qvel_ref: solver_smooth_adjoint(
+          m, d, qacc_array=qa, qacc_smooth_ref=qs, qfrc_smooth_ref=qf, qpos_ref=qp, qvel_ref=qv
         ),
-        [qacc_array, qacc_smooth_ref, qfrc_smooth_ref, qvel_ref],
+        [qacc_array, qacc_smooth_ref, qfrc_smooth_ref, qpos_ref, qvel_ref],
       )
     else:
       from mujoco_warp._src.adjoint import solver_implicit_adjoint
 
       tape.record_func(
-        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref, qf=qfrc_smooth_ref, qv=qvel_ref: solver_implicit_adjoint(
-          m, d, qacc_array=qa, qacc_smooth_ref=qs, qfrc_smooth_ref=qf, qvel_ref=qv
+        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref, qf=qfrc_smooth_ref, qp=qpos_ref, qv=qvel_ref: solver_implicit_adjoint(
+          m, d, qacc_array=qa, qacc_smooth_ref=qs, qfrc_smooth_ref=qf, qpos_ref=qp, qvel_ref=qv
         ),
-        [qacc_array, qacc_smooth_ref, qfrc_smooth_ref, qvel_ref],
+        [qacc_array, qacc_smooth_ref, qfrc_smooth_ref, qpos_ref, qvel_ref],
       )
 
 
