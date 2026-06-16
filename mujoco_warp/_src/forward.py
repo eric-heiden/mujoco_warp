@@ -277,6 +277,10 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
   act_in = wp.clone(d.act) if ad_active else d.act
   qvel_prev = wp.clone(d.qvel) if ad_active else d.qvel
   qpos_prev = wp.clone(d.qpos) if ad_active else d.qpos
+  if ad_active:
+    d.act = wp.empty_like(d.act, requires_grad=True)
+    d.qvel = wp.empty_like(d.qvel, requires_grad=True)
+    d.qpos = wp.empty_like(d.qpos, requires_grad=True)
 
   # advance activations
   wp.launch(
@@ -1434,6 +1438,40 @@ def _accumulate_dense_mass_solve_m_grad(
   M_grad_out[worldid, row, col] = M_grad_out[worldid, row, col] + grad
 
 
+@wp.kernel
+def _accumulate_dense_euler_damp_m_grad(
+  # In:
+  v: wp.array2d[float],
+  qacc_in: wp.array2d[float],
+  qacc_damped: wp.array2d[float],
+  # Out:
+  M_grad_out: wp.array3d[float],
+):
+  worldid, row, col = wp.tid()
+
+  if row > col:
+    return
+
+  z_row = qacc_in[worldid, row] - qacc_damped[worldid, row]
+  z_col = qacc_in[worldid, col] - qacc_damped[worldid, col]
+  grad = v[worldid, row] * z_col
+  if row != col:
+    grad += v[worldid, col] * z_row
+
+  M_grad_out[worldid, row, col] = M_grad_out[worldid, row, col] + grad
+
+
+@wp.kernel
+def _accumulate_grad_3d_kernel(
+  # In:
+  src: wp.array3d[float],
+  # Out:
+  dst_out: wp.array3d[float],
+):
+  worldid, row, col = wp.tid()
+  dst_out[worldid, row, col] = dst_out[worldid, row, col] + src[worldid, row, col]
+
+
 def _record_fwd_accel_adjoint(m: Model, d: Data):
   """Record custom adjoint for the M_inv solve in fwd_acceleration.
 
@@ -1459,8 +1497,20 @@ def _record_fwd_accel_adjoint(m: Model, d: Data):
     M_ref = d.M
     qacc_smooth_ref = d.qacc_smooth
     qfrc_smooth_ref = d.qfrc_smooth
+    cdof_ref = d.cdof
+    crb_ref = d.crb
+    cinert_ref = d.cinert
 
-    def _adjoint(m=m, d=d, M=M_ref, qacc_smooth=qacc_smooth_ref, qfrc_smooth=qfrc_smooth_ref):
+    def _adjoint(
+      m=m,
+      d=d,
+      M=M_ref,
+      qacc_smooth=qacc_smooth_ref,
+      qfrc_smooth=qfrc_smooth_ref,
+      cdof=cdof_ref,
+      crb=crb_ref,
+      cinert=cinert_ref,
+    ):
       adj_qacc_smooth = qacc_smooth.grad
       if adj_qacc_smooth is None:
         return
@@ -1470,6 +1520,7 @@ def _record_fwd_accel_adjoint(m: Model, d: Data):
       smooth.solve_m(m, d, tmp, adj_qacc_smooth)
       if qfrc_smooth.grad is None:
         qfrc_smooth.grad = tmp
+        tape.gradients[qfrc_smooth] = qfrc_smooth.grad
       else:
         wp.launch(
           _accumulate_grad_kernel,
@@ -1479,16 +1530,23 @@ def _record_fwd_accel_adjoint(m: Model, d: Data):
         )
 
       if not m.is_sparse:
+        M_grad_contrib = wp.zeros_like(M)
         if M.grad is None:
           M.grad = wp.zeros_like(M)
+          tape.gradients[M] = M.grad
         wp.launch(
           _accumulate_dense_mass_solve_m_grad,
           dim=(d.nworld, m.nv, m.nv),
           inputs=[tmp, qacc_smooth],
-          outputs=[M.grad],
+          outputs=[M_grad_contrib],
         )
+        wp.launch(_accumulate_grad_3d_kernel, dim=(d.nworld, m.nv, m.nv), inputs=[M_grad_contrib], outputs=[M.grad])
+        import os
 
-    tape.record_func(_adjoint, [qacc_smooth_ref, qfrc_smooth_ref, M_ref])
+        if os.environ.get("MJW_DISABLE_M_VJP") != "1":
+          smooth.accumulate_dense_M_adjoint(m, d, M_grad_contrib, cdof, crb, cinert, tape)
+
+    tape.record_func(_adjoint, [qacc_smooth_ref, qfrc_smooth_ref, M_ref, cdof_ref, crb_ref, cinert_ref])
 
 
 def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
@@ -1551,6 +1609,10 @@ def _record_euler_damp_adjoint(m: Model, d: Data, qacc: wp.array):
   # so this captures the correct per-substep mass matrix.
   qM_ref = d.M
   qacc_ref = qacc
+  qacc_input_ref = d.qacc
+  cdof_ref = d.cdof
+  crb_ref = d.crb
+  cinert_ref = d.cinert
 
   # Capture the damping derivative used by the forward Euler solve so the
   # adjoint applies exactly the same M + dt*D transform. Computed at record
@@ -1565,7 +1627,17 @@ def _record_euler_damp_adjoint(m: Model, d: Data, qacc: wp.array):
     outputs=[damp_deriv_ref],
   )
 
-  def _adjoint(m=m, d=d, qM=qM_ref, qacc_arr=qacc_ref, damp_deriv=damp_deriv_ref):
+  def _adjoint(
+    m=m,
+    d=d,
+    qM=qM_ref,
+    qacc_arr=qacc_ref,
+    qacc_input=qacc_input_ref,
+    damp_deriv=damp_deriv_ref,
+    cdof=cdof_ref,
+    crb=crb_ref,
+    cinert=cinert_ref,
+  ):
     adj_qacc = qacc_arr.grad
     if adj_qacc is None:
       return
@@ -1595,6 +1667,22 @@ def _record_euler_damp_adjoint(m: Model, d: Data, qacc: wp.array):
     tmp = wp.zeros((d.nworld, nv), dtype=float)
     smooth.factor_solve_i(m, d, qM_damp, qLD_tmp, qLDiagInv_tmp, tmp, adj_qacc)
 
+    import os
+
+    if not m.is_sparse and os.environ.get("MJW_ENABLE_EULER_M_VJP") == "1":
+      M_grad_contrib = wp.zeros_like(qM)
+      wp.launch(
+        _accumulate_dense_euler_damp_m_grad,
+        dim=(d.nworld, nv, nv),
+        inputs=[tmp, qacc_input, qacc_arr],
+        outputs=[M_grad_contrib],
+      )
+      if qM.grad is None:
+        qM.grad = wp.zeros_like(qM)
+        tape.gradients[qM] = qM.grad
+      wp.launch(_accumulate_grad_3d_kernel, dim=(d.nworld, nv, nv), inputs=[M_grad_contrib], outputs=[qM.grad])
+      smooth.accumulate_dense_M_adjoint(m, d, M_grad_contrib, cdof, crb, cinert, tape)
+
     # Step 3: result = M * tmp (using original undamped mass matrix)
     result = wp.zeros((d.nworld, nv), dtype=float)
     support.mul_m(m, d, result, tmp, M=qM)
@@ -1602,7 +1690,7 @@ def _record_euler_damp_adjoint(m: Model, d: Data, qacc: wp.array):
     # Step 4: Overwrite qacc.grad with the corrected adjoint
     wp.copy(qacc_arr.grad, result)
 
-  tape.record_func(_adjoint, [qacc_ref])
+  tape.record_func(_adjoint, [qacc_ref, qacc_input_ref, qM_ref, cdof_ref, crb_ref, cinert_ref])
 
 
 @event_scope
@@ -1700,6 +1788,7 @@ def _isolate_intermediates_for_ad(m: Model, d: Data):
   # zeros_like to match the exact dtype and shape from the existing arrays.
   d.xpos = wp.zeros_like(d.xpos, requires_grad=True)
   # Preserve rows that are only initialized once, such as the world body.
+  d.xquat = _clone_with_grad(d.xquat)
   d.xmat = _clone_with_grad(d.xmat)
   d.xipos = wp.zeros_like(d.xipos, requires_grad=True)
   d.ximat = _clone_with_grad(d.ximat)

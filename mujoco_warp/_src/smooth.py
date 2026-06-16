@@ -94,6 +94,36 @@ def _process_joint(
 
 
 @wp.kernel
+def _free_joint_kinematics(
+  # Model:
+  jnt_type: wp.array[int],
+  jnt_qposadr: wp.array[int],
+  jnt_bodyid: wp.array[int],
+  jnt_axis: wp.array2d[wp.vec3],
+  # Data in:
+  qpos_in: wp.array2d[float],
+  # Data out:
+  xpos_out: wp.array2d[wp.vec3],
+  xquat_out: wp.array2d[wp.quat],
+  xanchor_out: wp.array2d[wp.vec3],
+  xaxis_out: wp.array2d[wp.vec3],
+):
+  worldid, jntid = wp.tid()
+
+  if jnt_type[jntid] == JointType.FREE:
+    qadr = jnt_qposadr[jntid]
+    xpos = wp.vec3(qpos_in[worldid, qadr], qpos_in[worldid, qadr + 1], qpos_in[worldid, qadr + 2])
+    xquat = wp.quat(qpos_in[worldid, qadr + 3], qpos_in[worldid, qadr + 4], qpos_in[worldid, qadr + 5], qpos_in[worldid, qadr + 6])
+    xquat = wp.normalize(xquat)
+
+    bodyid = jnt_bodyid[jntid]
+    xpos_out[worldid, bodyid] = xpos
+    xquat_out[worldid, bodyid] = xquat
+    xanchor_out[worldid, jntid] = xpos
+    xaxis_out[worldid, jntid] = jnt_axis[worldid % jnt_axis.shape[0], jntid]
+
+
+@wp.kernel
 def _kinematics_branch(
   # Model:
   qpos0: wp.array2d[float],
@@ -144,13 +174,8 @@ def _kinematics_branch(
         is_free = int(1)
 
     if is_free == int(1):
-      qadr = jnt_qposadr[jntadr]
-      xpos = wp.vec3(qpos[qadr], qpos[qadr + 1], qpos[qadr + 2])
-      xquat = wp.quat(qpos[qadr + 3], qpos[qadr + 4], qpos[qadr + 5], qpos[qadr + 6])
-      xquat = wp.normalize(xquat)
-
-      xanchor_out[worldid, jntadr] = xpos
-      xaxis_out[worldid, jntadr] = jnt_axis[worldid % jnt_axis.shape[0], jntadr]
+      xpos = xpos_out[worldid, bodyid]
+      xquat = xquat_out[worldid, bodyid]
     else:
       # regular or no joints
       # apply fixed translation and rotation relative to parent
@@ -239,8 +264,8 @@ def _kinematics_branch(
 
       xquat = wp.normalize(xquat)
 
-    xpos_out[worldid, bodyid] = xpos
-    xquat_out[worldid, bodyid] = xquat
+      xpos_out[worldid, bodyid] = xpos
+      xquat_out[worldid, bodyid] = xquat
 
 
 @wp.kernel
@@ -475,6 +500,20 @@ def kinematics(m: Model, d: Data):
   derived positions and orientations of geoms, sites, and flexible elements, based on the
   current joint positions and any attached mocap bodies.
   """
+  if m.njnt:
+    wp.launch(
+      _free_joint_kinematics,
+      dim=(d.nworld, m.njnt),
+      inputs=[
+        m.jnt_type,
+        m.jnt_qposadr,
+        m.jnt_bodyid,
+        m.jnt_axis,
+        d.qpos,
+      ],
+      outputs=[d.xpos, d.xquat, d.xanchor, d.xaxis],
+    )
+
   wp.launch(
     _kinematics_branch,
     dim=(d.nworld, m.nbranch),
@@ -738,10 +777,13 @@ def _record_cinert_adjoint(m: Model, d: Data):
       return
     if xipos.grad is None:
       xipos.grad = wp.zeros_like(xipos)
+      tape.gradients[xipos] = xipos.grad
     if ximat.grad is None:
       ximat.grad = wp.zeros_like(ximat)
+      tape.gradients[ximat] = ximat.grad
     if subtree_com.grad is None:
       subtree_com.grad = wp.zeros_like(subtree_com)
+      tape.gradients[subtree_com] = subtree_com.grad
 
     wp.launch(
       _accumulate_cinert_adjoint,
@@ -778,24 +820,23 @@ def _cdof(
   # compute com-anchor vector
   offset = subtree_com_in[worldid, body_rootid[bodyid]] - xanchor_in[worldid, jntid]
 
-  res = cdof_out[worldid]
   if jnt_type_ == JointType.FREE:
-    res[dofid + 0] = wp.spatial_vector(0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
-    res[dofid + 1] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
-    res[dofid + 2] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    cdof_out[worldid, dofid + 0] = wp.spatial_vector(0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    cdof_out[worldid, dofid + 1] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    cdof_out[worldid, dofid + 2] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
     # I_3 rotation in child frame (assume no subsequent rotations)
-    res[dofid + 3] = wp.spatial_vector(xmat[0], wp.cross(xmat[0], offset))
-    res[dofid + 4] = wp.spatial_vector(xmat[1], wp.cross(xmat[1], offset))
-    res[dofid + 5] = wp.spatial_vector(xmat[2], wp.cross(xmat[2], offset))
+    cdof_out[worldid, dofid + 3] = wp.spatial_vector(xmat[0], wp.cross(xmat[0], offset))
+    cdof_out[worldid, dofid + 4] = wp.spatial_vector(xmat[1], wp.cross(xmat[1], offset))
+    cdof_out[worldid, dofid + 5] = wp.spatial_vector(xmat[2], wp.cross(xmat[2], offset))
   elif jnt_type_ == JointType.BALL:  # ball
     # I_3 rotation in child frame (assume no subsequent rotations)
-    res[dofid + 0] = wp.spatial_vector(xmat[0], wp.cross(xmat[0], offset))
-    res[dofid + 1] = wp.spatial_vector(xmat[1], wp.cross(xmat[1], offset))
-    res[dofid + 2] = wp.spatial_vector(xmat[2], wp.cross(xmat[2], offset))
+    cdof_out[worldid, dofid + 0] = wp.spatial_vector(xmat[0], wp.cross(xmat[0], offset))
+    cdof_out[worldid, dofid + 1] = wp.spatial_vector(xmat[1], wp.cross(xmat[1], offset))
+    cdof_out[worldid, dofid + 2] = wp.spatial_vector(xmat[2], wp.cross(xmat[2], offset))
   elif jnt_type_ == JointType.SLIDE:
-    res[dofid] = wp.spatial_vector(wp.vec3(0.0), xaxis)
+    cdof_out[worldid, dofid] = wp.spatial_vector(wp.vec3(0.0), xaxis)
   elif jnt_type_ == JointType.HINGE:  # hinge
-    res[dofid] = wp.spatial_vector(xaxis, wp.cross(xaxis, offset))
+    cdof_out[worldid, dofid] = wp.spatial_vector(xaxis, wp.cross(xaxis, offset))
 
 
 @event_scope
@@ -1003,7 +1044,7 @@ def camlight(m: Model, d: Data):
   )
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _crb_accumulate(
   # Model:
   body_parentid: wp.array[int],
@@ -1020,6 +1061,67 @@ def _crb_accumulate(
   if pid == 0:
     return
   wp.atomic_add(crb_out, worldid, pid, crb_in[worldid, bodyid])
+
+
+@wp.kernel(enable_backward=False)
+def _crb_propagate_adjoint(
+  # Model:
+  body_parentid: wp.array[int],
+  # In:
+  body_tree_: wp.array[int],
+  # Data grad in/out:
+  crb_grad_out: wp.array2d[vec10],
+):
+  worldid, nodeid = wp.tid()
+  bodyid = body_tree_[nodeid]
+  pid = body_parentid[bodyid]
+  if pid == 0:
+    return
+  crb_grad_out[worldid, bodyid] = crb_grad_out[worldid, bodyid] + crb_grad_out[worldid, pid]
+
+
+@wp.kernel(enable_backward=False)
+def _accumulate_crb_to_cinert_adjoint(
+  # Data grad in:
+  crb_grad_in: wp.array2d[vec10],
+  # Data grad out:
+  cinert_grad_out: wp.array2d[vec10],
+):
+  worldid, bodyid = wp.tid()
+  cinert_grad_out[worldid, bodyid] = cinert_grad_out[worldid, bodyid] + crb_grad_in[worldid, bodyid]
+
+
+def _record_crb_adjoint(m: Model, d: Data):
+  tape = wp._src.context.runtime.tape
+  if tape is None or not d.qpos.requires_grad:
+    return
+
+  crb_ref = d.crb
+  cinert_ref = d.cinert
+
+  def _adjoint(m=m, d=d, crb=crb_ref, cinert=cinert_ref):
+    if crb.grad is None:
+      return
+
+    for body_tree in m.body_tree:
+      wp.launch(
+        _crb_propagate_adjoint,
+        dim=(d.nworld, body_tree.size),
+        inputs=[m.body_parentid, body_tree],
+        outputs=[crb.grad],
+      )
+
+    if cinert.grad is None:
+      cinert.grad = wp.zeros_like(cinert)
+      tape.gradients[cinert] = cinert.grad
+    wp.launch(
+      _accumulate_crb_to_cinert_adjoint,
+      dim=(d.nworld, m.nbody),
+      inputs=[crb.grad],
+      outputs=[cinert.grad],
+    )
+
+  tape.record_func(_adjoint, [crb_ref, cinert_ref])
 
 
 @wp.kernel
@@ -1053,7 +1155,23 @@ def _M_sparse(
     dofid = dof_parentid[dofid]
 
 
-@wp.kernel
+@wp.func
+def _inert_vec_inertia_vjp_crb(v: wp.spatial_vector, g: wp.spatial_vector) -> vec10:
+  res = vec10()
+  res[0] = g[0] * v[0]
+  res[1] = g[1] * v[1]
+  res[2] = g[2] * v[2]
+  res[3] = g[0] * v[1] + g[1] * v[0]
+  res[4] = g[0] * v[2] + g[2] * v[0]
+  res[5] = g[1] * v[2] + g[2] * v[1]
+  res[6] = -g[1] * v[5] + g[2] * v[4] + g[4] * v[2] - g[5] * v[1]
+  res[7] = g[0] * v[5] - g[2] * v[3] - g[3] * v[2] + g[5] * v[0]
+  res[8] = -g[0] * v[4] + g[1] * v[3] + g[3] * v[1] - g[4] * v[0]
+  res[9] = g[3] * v[3] + g[4] * v[4] + g[5] * v[5]
+  return res
+
+
+@wp.kernel(enable_backward=False)
 def _M_dense(
   # Model:
   dof_bodyid: wp.array[int],
@@ -1093,6 +1211,115 @@ def _M_dense(
     cursor = dof_parentid[cursor]
 
   M_out[worldid, row, col] = M
+
+
+@wp.func
+def _accumulate_M_entry_adjoint(
+  worldid: int,
+  row: int,
+  col: int,
+  bodyid: int,
+  g: float,
+  cdof_in: wp.array2d[wp.spatial_vector],
+  crb_in: wp.array2d[vec10],
+  cdof_grad_out: wp.array2d[wp.spatial_vector],
+  crb_grad_out: wp.array2d[vec10],
+):
+  cdof_row = cdof_in[worldid, row]
+  cdof_col = cdof_in[worldid, col]
+  crb = crb_in[worldid, bodyid]
+  row_force = math.inert_vec(crb, cdof_row)
+  col_force = math.inert_vec(crb, cdof_col)
+  wp.atomic_add(crb_grad_out, worldid, bodyid, _inert_vec_inertia_vjp_crb(cdof_row, cdof_col * g))
+  wp.atomic_add(cdof_grad_out, worldid, col, row_force * g)
+  wp.atomic_add(cdof_grad_out, worldid, row, col_force * g)
+
+
+@wp.kernel(enable_backward=False)
+def _M_dense_adjoint(
+  # Model:
+  dof_bodyid: wp.array[int],
+  dof_parentid: wp.array[int],
+  # Data in:
+  cdof_in: wp.array2d[wp.spatial_vector],
+  crb_in: wp.array2d[vec10],
+  M_grad_in: wp.array3d[float],
+  # Data grad out:
+  cdof_grad_out: wp.array2d[wp.spatial_vector],
+  crb_grad_out: wp.array2d[vec10],
+):
+  worldid, row, col = wp.tid()
+  g = M_grad_in[worldid, row, col]
+  if g == 0.0:
+    return
+
+  if row == col:
+    bodyid = dof_bodyid[row]
+    cdof = cdof_in[worldid, row]
+    crb = crb_in[worldid, bodyid]
+    force = math.inert_vec(crb, cdof)
+    wp.atomic_add(crb_grad_out, worldid, bodyid, _inert_vec_inertia_vjp_crb(cdof, cdof * g))
+    wp.atomic_add(cdof_grad_out, worldid, row, force * (2.0 * g))
+    return
+
+  cursor = row
+  while cursor >= 0:
+    if cursor == col:
+      _accumulate_M_entry_adjoint(worldid, row, col, dof_bodyid[row], g, cdof_in, crb_in, cdof_grad_out, crb_grad_out)
+    cursor = dof_parentid[cursor]
+
+  cursor = col
+  while cursor >= 0:
+    if cursor == row:
+      _accumulate_M_entry_adjoint(worldid, row, col, dof_bodyid[col], g, cdof_in, crb_in, cdof_grad_out, crb_grad_out)
+    cursor = dof_parentid[cursor]
+
+
+def accumulate_dense_M_adjoint(
+  m: Model,
+  d: Data,
+  M_grad: wp.array3d[float],
+  cdof: wp.array,
+  crb: wp.array,
+  cinert: wp.array,
+  tape: wp.Tape | None = None,
+):
+  if tape is None:
+    tape = wp._src.context.runtime.tape
+  if tape is None:
+    return
+
+  if cdof.grad is None:
+    cdof.grad = wp.zeros_like(cdof)
+    tape.gradients[cdof] = cdof.grad
+  if crb.grad is None:
+    crb.grad = wp.zeros_like(crb)
+    tape.gradients[crb] = crb.grad
+
+  wp.launch(
+    _M_dense_adjoint,
+    dim=(d.nworld, m.nv, m.nv),
+    inputs=[m.dof_bodyid, m.dof_parentid, cdof, crb, M_grad],
+    outputs=[cdof.grad, crb.grad],
+  )
+
+  for body_tree in m.body_tree:
+    wp.launch(
+      _crb_propagate_adjoint,
+      dim=(d.nworld, body_tree.size),
+      inputs=[m.body_parentid, body_tree],
+      outputs=[crb.grad],
+    )
+
+  if cinert.grad is None:
+    cinert.grad = wp.zeros_like(cinert)
+    tape.gradients[cinert] = cinert.grad
+  wp.launch(
+    _accumulate_crb_to_cinert_adjoint,
+    dim=(d.nworld, m.nbody),
+    inputs=[crb.grad],
+    outputs=[cinert.grad],
+  )
 
 
 @event_scope
@@ -1331,96 +1558,161 @@ def _rne_cacc_world(m: Model, d: Data):
 
 # kernel_analyzer: off
 @wp.func
-def _process_dof_cacc(
+def _add_scaled_spatial(value: wp.spatial_vector, delta: wp.spatial_vector, scale: float) -> wp.spatial_vector:
+  return wp.spatial_vector(
+    value[0] + delta[0] * scale,
+    value[1] + delta[1] * scale,
+    value[2] + delta[2] * scale,
+    value[3] + delta[3] * scale,
+    value[4] + delta[4] * scale,
+    value[5] + delta[5] * scale,
+  )
+
+
+@wp.func
+def _process_dof_cacc_from_cvel(
   local_cacc: wp.spatial_vector,
+  cdof_dot_cvel: wp.spatial_vector,
   dofadr: int,
   worldid: int,
   qvel_in: wp.array2d[float],
   qacc_in: wp.array2d[float],
   cdof_in: wp.array2d[wp.spatial_vector],
-  cdof_dot_in: wp.array2d[wp.spatial_vector],
+  flg_acc: bool,
+  include_coriolis: bool,
+):
+  cdof = cdof_in[worldid, dofadr]
+  if include_coriolis:
+    local_cacc = _add_scaled_spatial(local_cacc, math.motion_cross(cdof_dot_cvel, cdof), qvel_in[worldid, dofadr])
+  if flg_acc:
+    local_cacc = _add_scaled_spatial(local_cacc, cdof, qacc_in[worldid, dofadr])
+  return local_cacc
+
+
+@wp.func
+def _process_joint_cacc_from_cvel(
+  local_cacc: wp.spatial_vector,
+  local_cvel: wp.spatial_vector,
+  dofid: int,
+  jntadr: int,
+  worldid: int,
+  jnt_type: wp.array[int],
+  qvel_in: wp.array2d[float],
+  qacc_in: wp.array2d[float],
+  cdof_in: wp.array2d[wp.spatial_vector],
   flg_acc: bool,
 ):
-  """Accumulate one DOF contribution to body acceleration."""
-  local_cacc += cdof_dot_in[worldid, dofadr] * qvel_in[worldid, dofadr]
-  if flg_acc:
-    local_cacc += cdof_in[worldid, dofadr] * qacc_in[worldid, dofadr]
-  return local_cacc
+  jnttype = jnt_type[jntadr]
+
+  if jnttype == JointType.FREE:
+    local_cacc = _process_dof_cacc_from_cvel(local_cacc, local_cvel, dofid + 0, worldid, qvel_in, qacc_in, cdof_in, flg_acc, False)
+    local_cacc = _process_dof_cacc_from_cvel(local_cacc, local_cvel, dofid + 1, worldid, qvel_in, qacc_in, cdof_in, flg_acc, False)
+    local_cacc = _process_dof_cacc_from_cvel(local_cacc, local_cvel, dofid + 2, worldid, qvel_in, qacc_in, cdof_in, flg_acc, False)
+
+    local_cvel = _add_scaled_spatial(local_cvel, cdof_in[worldid, dofid + 0], qvel_in[worldid, dofid + 0])
+    local_cvel = _add_scaled_spatial(local_cvel, cdof_in[worldid, dofid + 1], qvel_in[worldid, dofid + 1])
+    local_cvel = _add_scaled_spatial(local_cvel, cdof_in[worldid, dofid + 2], qvel_in[worldid, dofid + 2])
+
+    local_cacc = _process_dof_cacc_from_cvel(local_cacc, local_cvel, dofid + 3, worldid, qvel_in, qacc_in, cdof_in, flg_acc, True)
+    local_cacc = _process_dof_cacc_from_cvel(local_cacc, local_cvel, dofid + 4, worldid, qvel_in, qacc_in, cdof_in, flg_acc, True)
+    local_cacc = _process_dof_cacc_from_cvel(local_cacc, local_cvel, dofid + 5, worldid, qvel_in, qacc_in, cdof_in, flg_acc, True)
+
+    local_cvel = _add_scaled_spatial(local_cvel, cdof_in[worldid, dofid + 3], qvel_in[worldid, dofid + 3])
+    local_cvel = _add_scaled_spatial(local_cvel, cdof_in[worldid, dofid + 4], qvel_in[worldid, dofid + 4])
+    local_cvel = _add_scaled_spatial(local_cvel, cdof_in[worldid, dofid + 5], qvel_in[worldid, dofid + 5])
+    dofid += 6
+  elif jnttype == JointType.BALL:
+    local_cacc = _process_dof_cacc_from_cvel(local_cacc, local_cvel, dofid + 0, worldid, qvel_in, qacc_in, cdof_in, flg_acc, True)
+    local_cacc = _process_dof_cacc_from_cvel(local_cacc, local_cvel, dofid + 1, worldid, qvel_in, qacc_in, cdof_in, flg_acc, True)
+    local_cacc = _process_dof_cacc_from_cvel(local_cacc, local_cvel, dofid + 2, worldid, qvel_in, qacc_in, cdof_in, flg_acc, True)
+
+    local_cvel = _add_scaled_spatial(local_cvel, cdof_in[worldid, dofid + 0], qvel_in[worldid, dofid + 0])
+    local_cvel = _add_scaled_spatial(local_cvel, cdof_in[worldid, dofid + 1], qvel_in[worldid, dofid + 1])
+    local_cvel = _add_scaled_spatial(local_cvel, cdof_in[worldid, dofid + 2], qvel_in[worldid, dofid + 2])
+    dofid += 3
+  else:
+    local_cacc = _process_dof_cacc_from_cvel(local_cacc, local_cvel, dofid, worldid, qvel_in, qacc_in, cdof_in, flg_acc, True)
+    local_cvel = _add_scaled_spatial(local_cvel, cdof_in[worldid, dofid], qvel_in[worldid, dofid])
+    dofid += 1
+
+  return local_cacc, local_cvel, dofid
 
 
 # kernel_analyzer: on
 
 
 @wp.kernel
-def _cacc_branch(
+def _cacc_level(
   # Model:
   body_parentid: wp.array[int],
-  body_dofnum: wp.array[int],
+  body_jntnum: wp.array[int],
+  body_jntadr: wp.array[int],
   body_dofadr: wp.array[int],
-  body_branches: wp.array[int],
-  body_branch_start: wp.array[int],
+  jnt_type: wp.array[int],
+  # In:
+  body_tree_: wp.array[int],
   # Data in:
   qvel_in: wp.array2d[float],
   qacc_in: wp.array2d[float],
   cdof_in: wp.array2d[wp.spatial_vector],
-  cdof_dot_in: wp.array2d[wp.spatial_vector],
+  cvel_in: wp.array2d[wp.spatial_vector],
   # In:
   flg_acc: bool,
   # Data out:
   cacc_out: wp.array2d[wp.spatial_vector],
 ):
-  worldid, branchid = wp.tid()
-
-  start = body_branch_start[branchid]
-  end = body_branch_start[branchid + 1]
-
-  bodyid = body_branches[start]
+  worldid, nodeid = wp.tid()
+  bodyid = body_tree_[nodeid]
   pid = body_parentid[bodyid]
   local_cacc = cacc_out[worldid, pid]
-  for i in range(start, end):
-    bodyid = body_branches[i]
-    dofnum = body_dofnum[bodyid]
-    dofadr = body_dofadr[bodyid]
+  local_cvel = cvel_in[worldid, pid]
+  dofadr = body_dofadr[bodyid]
+  jntadr = body_jntadr[bodyid]
+  jntnum = body_jntnum[bodyid]
 
-    # unrolled dof processing — avoids nested dynamic-range loop which
-    # produces incorrect gradients in warp's AD
-    if dofnum >= 1:
-      local_cacc = _process_dof_cacc(local_cacc, dofadr, worldid, qvel_in, qacc_in, cdof_in, cdof_dot_in, flg_acc)
-    if dofnum >= 2:
-      local_cacc = _process_dof_cacc(local_cacc, dofadr + 1, worldid, qvel_in, qacc_in, cdof_in, cdof_dot_in, flg_acc)
-    if dofnum >= 3:
-      local_cacc = _process_dof_cacc(local_cacc, dofadr + 2, worldid, qvel_in, qacc_in, cdof_in, cdof_dot_in, flg_acc)
-    if dofnum >= 4:
-      local_cacc = _process_dof_cacc(local_cacc, dofadr + 3, worldid, qvel_in, qacc_in, cdof_in, cdof_dot_in, flg_acc)
-    if dofnum >= 5:
-      local_cacc = _process_dof_cacc(local_cacc, dofadr + 4, worldid, qvel_in, qacc_in, cdof_in, cdof_dot_in, flg_acc)
-    if dofnum >= 6:
-      local_cacc = _process_dof_cacc(local_cacc, dofadr + 5, worldid, qvel_in, qacc_in, cdof_in, cdof_dot_in, flg_acc)
+  if jntnum >= 1:
+    local_cacc, local_cvel, dofadr = _process_joint_cacc_from_cvel(
+      local_cacc, local_cvel, dofadr, jntadr, worldid, jnt_type, qvel_in, qacc_in, cdof_in, flg_acc
+    )
+    if jntnum >= 2:
+      local_cacc, local_cvel, dofadr = _process_joint_cacc_from_cvel(
+        local_cacc, local_cvel, dofadr, jntadr + 1, worldid, jnt_type, qvel_in, qacc_in, cdof_in, flg_acc
+      )
+    if jntnum >= 3:
+      local_cacc, local_cvel, dofadr = _process_joint_cacc_from_cvel(
+        local_cacc, local_cvel, dofadr, jntadr + 2, worldid, jnt_type, qvel_in, qacc_in, cdof_in, flg_acc
+      )
+    if jntnum >= 4:
+      local_cacc, local_cvel, dofadr = _process_joint_cacc_from_cvel(
+        local_cacc, local_cvel, dofadr, jntadr + 3, worldid, jnt_type, qvel_in, qacc_in, cdof_in, flg_acc
+      )
 
-    cacc_out[worldid, bodyid] = local_cacc
+  cacc_out[worldid, bodyid] = local_cacc
 
 
 def _rne_cacc_forward(m: Model, d: Data, flg_acc: bool = False):
-  wp.launch(
-    _cacc_branch,
-    dim=(d.nworld, m.nbranch),
-    inputs=[
-      m.body_parentid,
-      m.body_dofnum,
-      m.body_dofadr,
-      m.body_branches,
-      m.body_branch_start,
-      d.qvel,
-      d.qacc,
-      d.cdof,
-      d.cdof_dot,
-      flg_acc,
-    ],
-    outputs=[d.cacc],
-  )
+  for body_tree in m.body_tree:
+    wp.launch(
+      _cacc_level,
+      dim=(d.nworld, body_tree.size),
+      inputs=[
+        m.body_parentid,
+        m.body_jntnum,
+        m.body_jntadr,
+        m.body_dofadr,
+        m.jnt_type,
+        body_tree,
+        d.qvel,
+        d.qacc,
+        d.cdof,
+        d.cvel,
+        flg_acc,
+      ],
+      outputs=[d.cacc],
+    )
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _cfrc(
   # Data in:
   cinert_in: wp.array2d[vec10],
@@ -1472,6 +1764,17 @@ def _motion_cross_force_rhs_vjp(v: wp.spatial_vector, g: wp.spatial_vector) -> w
   p_ang_grad = wp.cross(g_ang, v_ang)
   p_lin_grad = wp.cross(g_ang, v_lin) + wp.cross(g_lin, v_ang)
   return wp.spatial_vector(p_ang_grad, p_lin_grad)
+
+
+@wp.func
+def _motion_cross_force_lhs_vjp(v: wp.spatial_vector, f: wp.spatial_vector, g: wp.spatial_vector) -> wp.spatial_vector:
+  f_ang = wp.spatial_top(f)
+  f_lin = wp.spatial_bottom(f)
+  g_ang = wp.spatial_top(g)
+  g_lin = wp.spatial_bottom(g)
+  v_ang_grad = wp.cross(f_ang, g_ang) + wp.cross(f_lin, g_lin)
+  v_lin_grad = wp.cross(f_lin, g_ang)
+  return wp.spatial_vector(v_ang_grad, v_lin_grad)
 
 
 @wp.kernel(enable_backward=False)
@@ -1527,23 +1830,28 @@ def _accumulate_qfrc_bias_cfrc_total_grad(
 @wp.kernel(enable_backward=False)
 def _accumulate_cfrc_cinert_adjoint(
   # Data in:
+  cinert_in: wp.array2d[vec10],
   cacc_in: wp.array2d[wp.spatial_vector],
   cvel_in: wp.array2d[wp.spatial_vector],
   cfrc_base_grad_in: wp.array2d[wp.spatial_vector],
   # Data out:
   cinert_grad_out: wp.array2d[vec10],
+  cacc_grad_out: wp.array2d[wp.spatial_vector],
+  cvel_grad_out: wp.array2d[wp.spatial_vector],
 ):
   worldid, bodyid = wp.tid()
   if bodyid == 0:
     return
 
   g = cfrc_base_grad_in[worldid, bodyid]
+  cinert = cinert_in[worldid, bodyid]
   cacc = cacc_in[worldid, bodyid]
   cvel = cvel_in[worldid, bodyid]
+  inert_cvel = math.inert_vec(cinert, cvel)
+  inert_cvel_grad = _motion_cross_force_rhs_vjp(cvel, g)
 
   grad = _inert_vec_inertia_vjp(cacc, g)
-  cvel_grad = _motion_cross_force_rhs_vjp(cvel, g)
-  cross_grad = _inert_vec_inertia_vjp(cvel, cvel_grad)
+  cross_grad = _inert_vec_inertia_vjp(cvel, inert_cvel_grad)
 
   current = cinert_grad_out[worldid, bodyid]
   current[0] = current[0] + grad[0] + cross_grad[0]
@@ -1557,6 +1865,13 @@ def _accumulate_cfrc_cinert_adjoint(
   current[8] = current[8] + grad[8] + cross_grad[8]
   current[9] = current[9] + grad[9] + cross_grad[9]
   cinert_grad_out[worldid, bodyid] = current
+
+  cacc_grad_out[worldid, bodyid] = cacc_grad_out[worldid, bodyid] + math.inert_vec(cinert, g)
+  cvel_grad_out[worldid, bodyid] = (
+    cvel_grad_out[worldid, bodyid]
+    + _motion_cross_force_lhs_vjp(cvel, inert_cvel, g)
+    + math.inert_vec(cinert, inert_cvel_grad)
+  )
 
 
 def _record_cfrc_adjoint(m: Model, d: Data, cfrc_total_array: wp.array):
@@ -1619,19 +1934,28 @@ def _record_cfrc_adjoint(m: Model, d: Data, cfrc_total_array: wp.array):
       )
 
     cinert_force_grad = wp.zeros_like(cinert)
+    if cacc.grad is None:
+      cacc.grad = wp.zeros_like(cacc)
+      tape.gradients[cacc] = cacc.grad
+    if cvel.grad is None:
+      cvel.grad = wp.zeros_like(cvel)
+      tape.gradients[cvel] = cvel.grad
     wp.launch(
       _accumulate_cfrc_cinert_adjoint,
       dim=(d.nworld, m.nbody),
-      inputs=[cacc, cvel, cfrc_base_grad],
-      outputs=[cinert_force_grad],
+      inputs=[cinert, cacc, cvel, cfrc_base_grad],
+      outputs=[cinert_force_grad, cacc.grad, cvel.grad],
     )
 
     if xipos.grad is None:
       xipos.grad = wp.zeros_like(xipos)
+      tape.gradients[xipos] = xipos.grad
     if ximat.grad is None:
       ximat.grad = wp.zeros_like(ximat)
+      tape.gradients[ximat] = ximat.grad
     if subtree_com.grad is None:
       subtree_com.grad = wp.zeros_like(subtree_com)
+      tape.gradients[subtree_com] = subtree_com.grad
     wp.launch(
       _accumulate_cinert_adjoint,
       dim=(d.nworld, m.nbody),
@@ -2524,6 +2848,45 @@ def _comvel_branch(
     cvel_out[worldid, bodyid] = cvel
 
 
+@wp.kernel
+def _comvel_level(
+  # Model:
+  body_parentid: wp.array[int],
+  body_jntnum: wp.array[int],
+  body_jntadr: wp.array[int],
+  body_dofadr: wp.array[int],
+  jnt_type: wp.array[int],
+  # In:
+  body_tree_: wp.array[int],
+  # Data in:
+  qvel_in: wp.array2d[float],
+  cdof_in: wp.array2d[wp.spatial_vector],
+  # Data out:
+  cvel_out: wp.array2d[wp.spatial_vector],
+  cdof_dot_out: wp.array2d[wp.spatial_vector],
+):
+  worldid, nodeid = wp.tid()
+  bodyid = body_tree_[nodeid]
+  pid = body_parentid[bodyid]
+  cvel = cvel_out[worldid, pid]
+  dofid = body_dofadr[bodyid]
+  jntid = body_jntadr[bodyid]
+  jntnum = body_jntnum[bodyid]
+  qvel = qvel_in[worldid]
+  cdof = cdof_in[worldid]
+
+  if jntnum >= 1:
+    cvel, dofid = _process_joint_vel(cvel, dofid, jntid, worldid, jnt_type, qvel, cdof, cdof_dot_out)
+    if jntnum >= 2:
+      cvel, dofid = _process_joint_vel(cvel, dofid, jntid + 1, worldid, jnt_type, qvel, cdof, cdof_dot_out)
+    if jntnum >= 3:
+      cvel, dofid = _process_joint_vel(cvel, dofid, jntid + 2, worldid, jnt_type, qvel, cdof, cdof_dot_out)
+    if jntnum >= 4:
+      cvel, dofid = _process_joint_vel(cvel, dofid, jntid + 3, worldid, jnt_type, qvel, cdof, cdof_dot_out)
+
+  cvel_out[worldid, bodyid] = cvel
+
+
 @event_scope
 def com_vel(m: Model, d: Data):
   """Computes the spatial velocities (cvel) and the derivative `cdof_dot` for all bodies.
@@ -2533,22 +2896,22 @@ def com_vel(m: Model, d: Data):
   """
   wp.launch(_comvel_root, dim=(d.nworld, 6), inputs=[], outputs=[d.cvel])
 
-  wp.launch(
-    _comvel_branch,
-    dim=(d.nworld, m.nbranch),
-    inputs=[
-      m.body_parentid,
-      m.body_jntnum,
-      m.body_jntadr,
-      m.body_dofadr,
-      m.jnt_type,
-      m.body_branches,
-      m.body_branch_start,
-      d.qvel,
-      d.cdof,
-    ],
-    outputs=[d.cvel, d.cdof_dot],
-  )
+  for body_tree in m.body_tree:
+    wp.launch(
+      _comvel_level,
+      dim=(d.nworld, body_tree.size),
+      inputs=[
+        m.body_parentid,
+        m.body_jntnum,
+        m.body_jntadr,
+        m.body_dofadr,
+        m.jnt_type,
+        body_tree,
+        d.qvel,
+        d.cdof,
+      ],
+      outputs=[d.cvel, d.cdof_dot],
+    )
 
 
 @wp.kernel
