@@ -812,7 +812,7 @@ def _subtree_div(
     subtree_com_out[worldid, bodyid] = com / mass
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _cinert(
   # Model:
   body_rootid: wp.array[int],
@@ -1018,6 +1018,7 @@ def com_pos(m: Model, d: Data):
     inputs=[m.body_rootid, m.body_mass, m.body_inertia, d.xipos, d.ximat, d.subtree_com],
     outputs=[d.cinert],
   )
+  _record_cinert_adjoint(m, d)
   wp.launch(
     _cdof,
     dim=(d.nworld, m.njnt),
