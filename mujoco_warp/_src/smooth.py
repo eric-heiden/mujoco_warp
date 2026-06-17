@@ -2103,7 +2103,7 @@ def _rne_cfrc(m: Model, d: Data, flg_cfrc_ext: bool = False):
   wp.launch(_cfrc, dim=[d.nworld, m.nbody], inputs=[d.cinert, d.cvel, d.cacc, d.cfrc_ext, flg_cfrc_ext], outputs=[d.cfrc_int])
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _cfrc_backward_level(
   # Model:
   body_parentid: wp.array[int],
@@ -2127,7 +2127,7 @@ def _cfrc_backward_level(
   cfrc_int_out[worldid, bodyid] = val
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _cfrc_backward(
   # Model:
   body_parentid: wp.array[int],
@@ -2174,7 +2174,7 @@ def _rne_cfrc_backward(m: Model, d: Data):
   return current
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _qfrc_bias(
   # Model:
   dof_bodyid: wp.array[int],
@@ -2187,6 +2187,62 @@ def _qfrc_bias(
   worldid, dofid = wp.tid()
   bodyid = dof_bodyid[dofid]
   qfrc_bias_out[worldid, dofid] = wp.dot(cdof_in[worldid, dofid], cfrc_int_in[worldid, bodyid])
+
+
+@wp.kernel(enable_backward=False)
+def _accumulate_qfrc_bias_adjoint(
+  # Model:
+  dof_bodyid: wp.array[int],
+  # Data in:
+  cdof_in: wp.array2d[wp.spatial_vector],
+  cfrc_int_in: wp.array2d[wp.spatial_vector],
+  qfrc_bias_grad_in: wp.array2d[float],
+  # Data grad out:
+  cdof_grad_out: wp.array2d[wp.spatial_vector],
+  cfrc_int_grad_out: wp.array2d[wp.spatial_vector],
+):
+  worldid, dofid = wp.tid()
+  bodyid = dof_bodyid[dofid]
+  g = qfrc_bias_grad_in[worldid, dofid]
+  cdof = cdof_in[worldid, dofid]
+  cfrc = cfrc_int_in[worldid, bodyid]
+  cdof_grad_out[worldid, dofid] = cdof_grad_out[worldid, dofid] + cfrc * g
+  wp.atomic_add(cfrc_int_grad_out, worldid, bodyid, cdof * g)
+
+
+def _record_qfrc_bias_adjoint(m: Model, d: Data, cfrc_total_array: wp.array):
+  tape = wp._src.context.runtime.tape
+  if tape is None or not d.qpos.requires_grad:
+    return
+
+  cdof_ref = d.cdof
+  cfrc_total_ref = cfrc_total_array
+  qfrc_bias_ref = d.qfrc_bias
+
+  def _adjoint(
+    m=m,
+    d=d,
+    cdof=cdof_ref,
+    cfrc_total=cfrc_total_ref,
+    qfrc_bias=qfrc_bias_ref,
+  ):
+    if qfrc_bias.grad is None:
+      return
+    if cdof.grad is None:
+      cdof.grad = wp.zeros_like(cdof)
+      tape.gradients[cdof] = cdof.grad
+    if cfrc_total.grad is None:
+      cfrc_total.grad = wp.zeros_like(cfrc_total)
+      tape.gradients[cfrc_total] = cfrc_total.grad
+
+    wp.launch(
+      _accumulate_qfrc_bias_adjoint,
+      dim=[d.nworld, m.nv],
+      inputs=[m.dof_bodyid, cdof, cfrc_total, qfrc_bias.grad],
+      outputs=[cdof.grad, cfrc_total.grad],
+    )
+
+  tape.record_func(_adjoint, [cdof_ref, cfrc_total_ref, qfrc_bias_ref])
 
 
 @event_scope
@@ -2207,6 +2263,7 @@ def rne(m: Model, d: Data, flg_acc: bool = False):
   cfrc_total = _rne_cfrc_backward(m, d)
   _record_cfrc_adjoint(m, d, cfrc_total)
   wp.launch(_qfrc_bias, dim=[d.nworld, m.nv], inputs=[m.dof_bodyid, d.cdof, cfrc_total], outputs=[d.qfrc_bias])
+  _record_qfrc_bias_adjoint(m, d, cfrc_total)
   # update d.cfrc_int with accumulated forces for downstream consumers
   d.cfrc_int = cfrc_total
 
