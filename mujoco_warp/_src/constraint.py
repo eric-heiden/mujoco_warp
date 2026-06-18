@@ -51,6 +51,17 @@ def _zero_constraint_counts(
   efc_nnz_out[worldid] = 0
 
 
+@wp.kernel
+def _copy_nefc_counts(
+  # Data in:
+  nefc_in: wp.array[int],
+  # Data out:
+  nefc_out: wp.array[int],
+):
+  worldid = wp.tid()
+  nefc_out[worldid] = nefc_in[worldid]
+
+
 @wp.func
 def _efc_row(
   # Model:
@@ -2039,7 +2050,9 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool):
     includemargin_in: wp.array[float],
     worldid_in: wp.array[int],
     geom_in: wp.array[wp.vec2i],
+    geomcollisionid_in: wp.array[int],
     type_in: wp.array[int],
+    contact_efc_base_in: wp.array[int],
     # Data out:
     nefc_out: wp.array[int],
     contact_efc_address_out: wp.array2d[int],
@@ -2076,8 +2089,59 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool):
 
     worldid = worldid_in[conid]
 
-    # Allocate contiguous block of efcids for all dimids
-    base_efcid = wp.atomic_add(nefc_out, worldid, ndim)
+    # Allocate a deterministic compact EFC block within each world.
+    #
+    # Contacts are produced into the global contact buffer with atomics, so the
+    # contact id order can differ across otherwise identical worlds.  The
+    # iterative constraint solver is order-sensitive at float precision, so
+    # assigning EFC ids from atomic arrival order causes identical clone worlds
+    # to diverge as soon as contacts appear.  Count same-world active contacts
+    # with smaller stable contact keys instead.
+    geom = geom_in[conid]
+    geom0 = geom[0]
+    geom1 = geom[1]
+    geomcollisionid = geomcollisionid_in[conid]
+    base_efcid = contact_efc_base_in[worldid]
+    for other_conid in range(nacon_in[0]):
+      if other_conid == conid:
+        continue
+      if not type_in[other_conid] & ContactType.CONSTRAINT:
+        continue
+      if worldid_in[other_conid] != worldid:
+        continue
+
+      other_pos = dist_in[other_conid] - includemargin_in[other_conid]
+      if other_pos >= 0.0:
+        continue
+
+      other_geom = geom_in[other_conid]
+      other_geom0 = other_geom[0]
+      other_geom1 = other_geom[1]
+      other_geomcollisionid = geomcollisionid_in[other_conid]
+
+      is_before = other_geom0 < geom0
+      is_before = is_before or (other_geom0 == geom0 and other_geom1 < geom1)
+      is_before = is_before or (
+        other_geom0 == geom0 and other_geom1 == geom1 and other_geomcollisionid < geomcollisionid
+      )
+      is_before = is_before or (
+        other_geom0 == geom0
+        and other_geom1 == geom1
+        and other_geomcollisionid == geomcollisionid
+        and other_conid < conid
+      )
+      if is_before:
+        other_condim = condim_in[other_conid]
+        if wp.static(IS_ELLIPTIC):
+          other_ndim = other_condim
+        else:
+          if other_condim == 1:
+            other_ndim = 1
+          else:
+            other_ndim = 2 * (other_condim - 1)
+        base_efcid += other_ndim
+
+    wp.atomic_max(nefc_out, worldid, base_efcid + ndim)
     for dim in range(ndim):
       efcid = base_efcid + dim
       if efcid >= njmax_in:
@@ -2088,7 +2152,6 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool):
         efc_id_out[worldid, efcid] = conid
 
     if wp.static(IS_SPARSE):
-      geom = geom_in[conid]
       body1 = body_weldid[geom_bodyid[geom[0]]]
       body2 = body_weldid[geom_bodyid[geom[1]]]
 
@@ -4053,6 +4116,13 @@ def make_constraint(m: types.Model, d: types.Data):
           ],
         )
       else:
+        contact_efc_base = wp.empty((d.nworld,), dtype=int)
+        wp.launch(
+          _copy_nefc_counts,
+          dim=d.nworld,
+          inputs=[d.nefc],
+          outputs=[contact_efc_base],
+        )
         wp.launch(
           _efc_contact_init(m.opt.cone, m.is_sparse),
           dim=d.naconmax,
@@ -4070,7 +4140,9 @@ def make_constraint(m: types.Model, d: types.Data):
             d.contact.includemargin,
             d.contact.worldid,
             d.contact.geom,
+            d.contact.geomcollisionid,
             d.contact.type,
+            contact_efc_base,
           ],
           outputs=[
             d.nefc,
