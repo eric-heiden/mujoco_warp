@@ -1289,12 +1289,13 @@ def _efc_level_gradients(m: types.Model, d: types.Data, v, qacc, qpos_ref=None, 
       qpos_ref = d.qpos
     contact_aref_grad = None
     efc_J = d.efc.J
-    if os.environ.get("MJW_DISABLE_EFC_J_VJP") != "1" and hasattr(efc_J, "grad") and efc_J.grad is not None:
+    if os.environ.get("MJW_DISABLE_EFC_J_VJP") != "1":
+      efc_J_grad = _ensure_grad(efc_J)
       wp.launch(
         _efc_J_grad_kernel,
         dim=(d.nworld, d.njmax_pad, m.nv_pad),
         inputs=[m.nv, d.nefc, d.efc.force, d.efc.state, d.efc.J, d.efc.D, d.njmax, v, qacc],
-        outputs=[efc_J.grad],
+        outputs=[efc_J_grad],
       )
 
     if os.environ.get("MJW_DISABLE_EFC_LIMIT_VJP") != "1" and d.solver_Jaref.shape[0] > 0:
@@ -1348,9 +1349,8 @@ def _efc_level_gradients(m: types.Model, d: types.Data, v, qacc, qpos_ref=None, 
     if (
       os.environ.get("MJW_DISABLE_EFC_POS_VJP") != "1"
       and contact_aref_grad is not None
-      and hasattr(efc_pos, "grad")
-      and efc_pos.grad is not None
     ):
+      efc_pos_grad = _ensure_grad(efc_pos)
       wp.launch(
         _efc_pos_grad_kernel,
         dim=(d.naconmax, 10),
@@ -1369,7 +1369,7 @@ def _efc_level_gradients(m: types.Model, d: types.Data, v, qacc, qpos_ref=None, 
           d.nacon,
           contact_aref_grad,
         ],
-        outputs=[efc_pos.grad],
+        outputs=[efc_pos_grad],
       )
 
     if os.environ.get("MJW_DISABLE_EFC_POS_VJP") != "1" and "limit_aref_grad" in locals() and limit_aref_grad is not None:
