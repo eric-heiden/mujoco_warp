@@ -88,7 +88,7 @@ def _efc_J_grad_kernel(
       jv = float(0.0)
       for j in range(nv):
         jv += efc_J_in[worldid, efcid, j] * v_in[worldid, j]
-      grad += efc_D_in[worldid, efcid] * jv * qacc_in[worldid, dofid]
+      grad -= efc_D_in[worldid, efcid] * jv * qacc_in[worldid, dofid]
     efc_J_grad_out[worldid, efcid, dofid] += grad
 
 
@@ -232,6 +232,294 @@ def _efc_vel_grad_kernel(
     if J != 0.0:
       wp.atomic_add(qvel_grad_out, worldid, dofid, adj_vel * J)
       wp.atomic_add(efc_J_grad_out, worldid, efcid, dofid, adj_vel * qvel_in[worldid, dofid])
+
+
+@wp.kernel
+def _contact_dist_grad_kernel(
+  # Model:
+  opt_timestep: wp.array[float],
+  opt_disableflags: int,
+  opt_impratio_invsqrt: wp.array[float],
+  body_invweight0: wp.array2d[wp.vec2],
+  geom_bodyid: wp.array[int],
+  # Contact in:
+  contact_dist_in: wp.array[float],
+  contact_includemargin_in: wp.array[float],
+  contact_friction_in: wp.array[types.vec5],
+  contact_solref_in: wp.array[wp.vec2],
+  contact_solimp_in: wp.array[types.vec5],
+  contact_dim_in: wp.array[int],
+  contact_geom_in: wp.array[wp.vec2i],
+  contact_efc_address_in: wp.array2d[int],
+  contact_worldid_in: wp.array[int],
+  contact_type_in: wp.array[int],
+  nacon_in: wp.array[int],
+  # EFC in:
+  efc_type_in: wp.array2d[int],
+  efc_pos_grad_in: wp.array2d[float],
+  efc_D_grad_in: wp.array2d[float],
+  # Out:
+  contact_dist_grad_out: wp.array[float],
+):
+  """Propagate manual EFC parameter adjoints to contact distance.
+
+  The solver adjoint writes EFC gradients from a tape callback.  In practice
+  those late writes are not reliably consumed by the generated backward for the
+  preceding contact-to-EFC assembly kernel, so route the scalar penetration
+  path directly.  The remaining contact position/frame Jacobian path is still
+  handled by generated backward when available.
+  """
+  conid, dimid = wp.tid()
+  if conid >= nacon_in[0]:
+    return
+  if not (contact_type_in[conid] & 1):  # ContactType.CONSTRAINT
+    return
+
+  condim = contact_dim_in[conid]
+  if condim == 1:
+    if dimid > 0:
+      return
+  elif dimid >= 2 * (condim - 1):
+    return
+
+  efcid = contact_efc_address_in[conid, dimid]
+  if efcid < 0:
+    return
+
+  worldid = contact_worldid_in[conid]
+  adj_pos = efc_pos_grad_in[worldid, efcid]
+  adj_D = efc_D_grad_in[worldid, efcid]
+  if adj_pos == 0.0 and adj_D == 0.0:
+    return
+
+  timestep = opt_timestep[worldid % opt_timestep.shape[0]]
+  solref = contact_solref_in[conid]
+  solimp = contact_solimp_in[conid]
+  includemargin = contact_includemargin_in[conid]
+  pos_val = contact_dist_in[conid] - includemargin
+
+  k_imp = compute_k_imp(opt_disableflags, solref, solimp, pos_val, timestep)
+  imp = k_imp[1]
+
+  dmin = wp.clamp(solimp[0], types.MJ_MINIMP, types.MJ_MAXIMP)
+  dmax = wp.clamp(solimp[1], types.MJ_MINIMP, types.MJ_MAXIMP)
+  width = wp.max(types.MJ_MINVAL, solimp[2])
+  mid = wp.clamp(solimp[3], types.MJ_MINIMP, types.MJ_MAXIMP)
+  power = wp.max(1.0, solimp[4])
+
+  imp_x = wp.abs(pos_val) / width
+  imp_slope_a = power * wp.pow(imp_x, power - 1.0) / wp.pow(mid, power - 1.0)
+  imp_slope_b = power * wp.pow(1.0 - imp_x, power - 1.0) / wp.pow(1.0 - mid, power - 1.0)
+  imp_slope_x = wp.where(imp_x < mid, imp_slope_a, imp_slope_b)
+  imp_slope_x = wp.where(imp_x > 1.0, 0.0, imp_slope_x)
+  pos_sign = wp.where(pos_val > 0.0, 1.0, wp.where(pos_val < 0.0, -1.0, 0.0))
+  dimp_dpos = (dmax - dmin) * imp_slope_x * pos_sign / width
+
+  # efc.pos = pos_aref + margin.  Pyramidal and frictionless contact rows use
+  # pos_aref=pos for every row; elliptic tangential rows use pos_aref=0.
+  dposout_dpos = float(1.0)
+  if efc_type_in[worldid, efcid] == types.ConstraintType.CONTACT_ELLIPTIC and dimid > 0:
+    dposout_dpos = 0.0
+
+  geom = contact_geom_in[conid]
+  body1 = geom_bodyid[geom[0]]
+  body2 = geom_bodyid[geom[1]]
+  body_invweight0_id = worldid % body_invweight0.shape[0]
+  invweight = body_invweight0[body_invweight0_id, body1][0] + body_invweight0[body_invweight0_id, body2][0]
+  if condim > 1:
+    friction = contact_friction_in[conid]
+    fri0 = friction[0]
+    impratio_invsqrt = opt_impratio_invsqrt[worldid % opt_impratio_invsqrt.shape[0]]
+    invweight = invweight + fri0 * fri0 * invweight
+    invweight = invweight * 2.0 * fri0 * fri0 * impratio_invsqrt * impratio_invsqrt
+
+  denom = invweight * (1.0 - imp) / imp
+  active_D = denom > types.MJ_MINVAL
+  dD_dimp = 1.0 / (invweight * (1.0 - imp) * (1.0 - imp))
+  dD_dpos = wp.where(active_D, dD_dimp * dimp_dpos, 0.0)
+
+  wp.atomic_add(contact_dist_grad_out, conid, adj_pos * dposout_dpos + adj_D * dD_dpos)
+
+
+@wp.kernel
+def _contact_J_geom_grad_kernel(
+  # Model:
+  nv: int,
+  opt_impratio_invsqrt: wp.array[float],
+  body_parentid: wp.array[int],
+  body_rootid: wp.array[int],
+  body_weldid: wp.array[int],
+  body_dofnum: wp.array[int],
+  body_dofadr: wp.array[int],
+  dof_bodyid: wp.array[int],
+  dof_parentid: wp.array[int],
+  geom_bodyid: wp.array[int],
+  body_isdofancestor: wp.array2d[int],
+  # Data in:
+  subtree_com_in: wp.array2d[wp.vec3],
+  cdof_in: wp.array2d[wp.spatial_vector],
+  contact_pos_in: wp.array[wp.vec3],
+  contact_frame_in: wp.array[wp.mat33],
+  contact_friction_in: wp.array[types.vec5],
+  contact_dim_in: wp.array[int],
+  contact_geom_in: wp.array[wp.vec2i],
+  contact_efc_address_in: wp.array2d[int],
+  contact_worldid_in: wp.array[int],
+  contact_type_in: wp.array[int],
+  nacon_in: wp.array[int],
+  efc_J_grad_in: wp.array3d[float],
+  disable_pos_vjp: int,
+  disable_frame_vjp: int,
+  disable_cdof_vjp: int,
+  disable_subtree_vjp: int,
+  # Out:
+  contact_pos_grad_out: wp.array[wp.vec3],
+  contact_frame_grad_out: wp.array[wp.mat33],
+  subtree_com_grad_out: wp.array2d[wp.vec3],
+  cdof_grad_out: wp.array2d[wp.spatial_vector],
+):
+  """Propagate explicit contact Jacobian adjoints to kinematic inputs."""
+  conid, dimid, dofid = wp.tid()
+  if conid >= nacon_in[0]:
+    return
+  if dofid >= nv:
+    return
+  if not (contact_type_in[conid] & 1):  # ContactType.CONSTRAINT
+    return
+
+  condim = contact_dim_in[conid]
+  if condim == 1:
+    if dimid > 0:
+      return
+  elif dimid >= 2 * (condim - 1):
+    return
+
+  efcid = contact_efc_address_in[conid, dimid]
+  if efcid < 0:
+    return
+
+  worldid = contact_worldid_in[conid]
+  adj_J = efc_J_grad_in[worldid, efcid, dofid]
+  if adj_J == 0.0:
+    return
+
+  geom = contact_geom_in[conid]
+  body1 = body_weldid[geom_bodyid[geom[0]]]
+  body2 = body_weldid[geom_bodyid[geom[1]]]
+  con_pos = contact_pos_in[conid]
+  frame = contact_frame_in[conid]
+
+  jac1p, jac1r = support.jac_dof(
+    body_parentid,
+    body_rootid,
+    dof_bodyid,
+    body_isdofancestor,
+    subtree_com_in,
+    cdof_in,
+    con_pos,
+    body1,
+    dofid,
+    worldid,
+  )
+  jac2p, jac2r = support.jac_dof(
+    body_parentid,
+    body_rootid,
+    dof_bodyid,
+    body_isdofancestor,
+    subtree_com_in,
+    cdof_in,
+    con_pos,
+    body2,
+    dofid,
+    worldid,
+  )
+
+  jacp_dif = jac2p - jac1p
+  jacr_dif = jac2r - jac1r
+  point_sensitivity = wp.vec3(0.0)
+
+  normal = wp.vec3(frame[0, 0], frame[0, 1], frame[0, 2])
+  jacp_axis = adj_J * normal
+  jacr_axis = wp.vec3(0.0)
+  g00 = adj_J * jacp_dif[0]
+  g01 = adj_J * jacp_dif[1]
+  g02 = adj_J * jacp_dif[2]
+  g10 = float(0.0)
+  g11 = float(0.0)
+  g12 = float(0.0)
+  g20 = float(0.0)
+  g21 = float(0.0)
+  g22 = float(0.0)
+  point_sensitivity += wp.cross(normal, jacr_dif)
+
+  if condim > 1:
+    dimid2 = dimid / 2 + 1
+    friction = contact_friction_in[conid]
+    frii = friction[dimid2 - 1]
+    sign = wp.where(dimid % 2 == 0, 1.0, -1.0)
+    scaled_adj = adj_J * sign * frii
+    if dimid2 < 3:
+      tangent = wp.vec3(frame[dimid2, 0], frame[dimid2, 1], frame[dimid2, 2])
+      if dimid2 == 1:
+        g10 += scaled_adj * jacp_dif[0]
+        g11 += scaled_adj * jacp_dif[1]
+        g12 += scaled_adj * jacp_dif[2]
+      else:
+        g20 += scaled_adj * jacp_dif[0]
+        g21 += scaled_adj * jacp_dif[1]
+        g22 += scaled_adj * jacp_dif[2]
+      jacp_axis += scaled_adj * tangent
+      point_sensitivity += sign * frii * wp.cross(tangent, jacr_dif)
+    else:
+      row = dimid2 - 3
+      rot_axis = wp.vec3(frame[row, 0], frame[row, 1], frame[row, 2])
+      if row == 0:
+        g00 += scaled_adj * jacr_dif[0]
+        g01 += scaled_adj * jacr_dif[1]
+        g02 += scaled_adj * jacr_dif[2]
+      elif row == 1:
+        g10 += scaled_adj * jacr_dif[0]
+        g11 += scaled_adj * jacr_dif[1]
+        g12 += scaled_adj * jacr_dif[2]
+      else:
+        g20 += scaled_adj * jacr_dif[0]
+        g21 += scaled_adj * jacr_dif[1]
+        g22 += scaled_adj * jacr_dif[2]
+      jacr_axis += scaled_adj * rot_axis
+
+  if disable_cdof_vjp == 0 and body_isdofancestor[body2, dofid] != 0:
+    root2 = body_rootid[body2]
+    offset2 = con_pos - wp.vec3(subtree_com_in[worldid, root2])
+    cdof2 = cdof_in[worldid, dofid]
+    cdof2_ang = wp.spatial_top(cdof2)
+    cdof2_grad_ang = wp.cross(offset2, jacp_axis) + jacr_axis
+    cdof2_grad_lin = jacp_axis
+    wp.atomic_add(cdof_grad_out, worldid, dofid, wp.spatial_vector(cdof2_grad_ang, cdof2_grad_lin))
+    if disable_subtree_vjp == 0:
+      wp.atomic_add(subtree_com_grad_out, worldid, root2, -wp.cross(jacp_axis, cdof2_ang))
+
+  if disable_cdof_vjp == 0 and body_isdofancestor[body1, dofid] != 0:
+    root1 = body_rootid[body1]
+    offset1 = con_pos - wp.vec3(subtree_com_in[worldid, root1])
+    cdof1 = cdof_in[worldid, dofid]
+    cdof1_ang = wp.spatial_top(cdof1)
+    body1_jacp_axis = -jacp_axis
+    body1_jacr_axis = -jacr_axis
+    cdof1_grad_ang = wp.cross(offset1, body1_jacp_axis) + body1_jacr_axis
+    cdof1_grad_lin = body1_jacp_axis
+    wp.atomic_add(cdof_grad_out, worldid, dofid, wp.spatial_vector(cdof1_grad_ang, cdof1_grad_lin))
+    if disable_subtree_vjp == 0:
+      wp.atomic_add(subtree_com_grad_out, worldid, root1, -wp.cross(body1_jacp_axis, cdof1_ang))
+
+  if disable_frame_vjp == 0:
+    wp.atomic_add(
+      contact_frame_grad_out,
+      conid,
+      wp.mat33(g00, g01, g02, g10, g11, g12, g20, g21, g22),
+    )
+
+  if disable_pos_vjp == 0:
+    wp.atomic_add(contact_pos_grad_out, conid, adj_J * point_sensitivity)
 
 
 @wp.kernel
@@ -1371,6 +1659,35 @@ def _efc_level_gradients(m: types.Model, d: types.Data, v, qacc, qpos_ref=None, 
         ],
         outputs=[efc_pos_grad],
       )
+      if os.environ.get("MJW_DISABLE_CONTACT_DIST_VJP") != "1":
+        contact_dist_grad = _ensure_grad(d.contact.dist)
+        D_grad_for_contact = _ensure_grad(d.efc.D)
+        wp.launch(
+          _contact_dist_grad_kernel,
+          dim=(d.naconmax, 10),
+          inputs=[
+            m.opt.timestep,
+            m.opt.disableflags,
+            m.opt.impratio_invsqrt,
+            m.body_invweight0,
+            m.geom_bodyid,
+            d.contact.dist,
+            d.contact.includemargin,
+            d.contact.friction,
+            d.contact.solref,
+            d.contact.solimp,
+            d.contact.dim,
+            d.contact.geom,
+            d.contact.efc_address,
+            d.contact.worldid,
+            d.contact.type,
+            d.nacon,
+            d.efc.type,
+            efc_pos_grad,
+            D_grad_for_contact,
+          ],
+          outputs=[contact_dist_grad],
+        )
 
     if os.environ.get("MJW_DISABLE_EFC_POS_VJP") != "1" and "limit_aref_grad" in locals() and limit_aref_grad is not None:
       qpos_grad = _ensure_grad(qpos_ref)
@@ -1434,6 +1751,60 @@ def _efc_level_gradients(m: types.Model, d: types.Data, v, qacc, qpos_ref=None, 
           qvel_ref,
         ],
         outputs=[qvel_grad, d.efc.J.grad],
+      )
+
+    if os.environ.get("MJW_DISABLE_CONTACT_J_VJP") != "1" and hasattr(d.efc.J, "grad") and d.efc.J.grad is not None:
+      contact_pos_grad = _ensure_grad(d.contact.pos)
+      contact_frame_grad = _ensure_grad(d.contact.frame)
+      wp.launch(
+        _contact_J_geom_grad_kernel,
+        dim=(d.naconmax, 10, m.nv),
+        inputs=[
+          m.nv,
+          m.opt.impratio_invsqrt,
+          m.body_parentid,
+          m.body_rootid,
+          m.body_weldid,
+          m.body_dofnum,
+          m.body_dofadr,
+          m.dof_bodyid,
+          m.dof_parentid,
+          m.geom_bodyid,
+          m.body_isdofancestor,
+          d.subtree_com,
+          d.cdof,
+          d.contact.pos,
+          d.contact.frame,
+          d.contact.friction,
+          d.contact.dim,
+          d.contact.geom,
+          d.contact.efc_address,
+          d.contact.worldid,
+          d.contact.type,
+          d.nacon,
+          d.efc.J.grad,
+          (
+            1
+            if os.environ.get("MJW_DISABLE_CONTACT_J_GEOM_VJP") == "1"
+            or os.environ.get("MJW_DISABLE_CONTACT_J_POS_VJP") == "1"
+            or os.environ.get("MJW_ENABLE_CONTACT_J_POS_VJP") != "1"
+            else 0
+          ),
+          (
+            1
+            if os.environ.get("MJW_DISABLE_CONTACT_J_GEOM_VJP") == "1"
+            or os.environ.get("MJW_DISABLE_CONTACT_J_FRAME_VJP") == "1"
+            else 0
+          ),
+          1 if os.environ.get("MJW_DISABLE_CONTACT_J_CDOF_VJP") == "1" else 0,
+          (
+            0
+            if os.environ.get("MJW_ENABLE_CONTACT_J_SUBTREE_VJP") == "1"
+            and os.environ.get("MJW_DISABLE_CONTACT_J_SUBTREE_VJP") != "1"
+            else 1
+          ),
+        ],
+        outputs=[contact_pos_grad, contact_frame_grad, _ensure_grad(d.subtree_com), _ensure_grad(d.cdof)],
       )
 
 
