@@ -34,7 +34,14 @@ def _ensure_array_grad(arr):
   return arr.grad
 
 
-def _accumulate_qfrc_smooth_vjp(m: types.Model, d: types.Data, qfrc_smooth_ref, adj_qacc_smooth):
+def _accumulate_qfrc_smooth_vjp(
+  m: types.Model,
+  d: types.Data,
+  qfrc_smooth_ref,
+  adj_qacc_smooth,
+  qLD_ref=None,
+  qLDiagInv_ref=None,
+):
   if qfrc_smooth_ref is None:
     return
 
@@ -42,7 +49,20 @@ def _accumulate_qfrc_smooth_vjp(m: types.Model, d: types.Data, qfrc_smooth_ref, 
 
   qfrc_grad = _ensure_array_grad(qfrc_smooth_ref)
   contrib = wp.zeros_like(qfrc_smooth_ref)
-  smooth.solve_m(m, d, contrib, adj_qacc_smooth)
+  mode = os.environ.get("MJW_QFRC_SMOOTH_VJP_MODE", "solve_m")
+  if mode == "direct":
+    wp.launch(
+      _accumulate_grad_kernel,
+      dim=(d.nworld, m.nv),
+      inputs=[adj_qacc_smooth],
+      outputs=[qfrc_grad],
+    )
+    return
+
+  if qLD_ref is not None and qLDiagInv_ref is not None:
+    smooth.solve_LD(m, d, qLD_ref, qLDiagInv_ref, contrib, adj_qacc_smooth)
+  else:
+    smooth.solve_m(m, d, contrib, adj_qacc_smooth)
   if os.environ.get("MJW_DEBUG_ADJOINT", "0") == "2":
     import numpy as np
 
@@ -166,7 +186,7 @@ def _efc_pos_grad_kernel(
   dimp_dpos = (dmax - dmin) * imp_slope_x * pos_sign / width
 
   # aref = -k * imp(pos) * pos - b * vel
-  daref_dpos = -k_imp[0] * (k_imp[1] + pos_val * dimp_dpos)
+  daref_dpos = -k_imp[0] * (k_imp[1] + pos_val * dimp_dpos) / wp.max(timestep, types.MJ_MINVAL)
 
   adj_aref = efc_aref_grad_in[worldid, efcid]
   wp.atomic_add(efc_pos_grad_out, worldid, efcid, adj_aref * daref_dpos)
@@ -339,6 +359,105 @@ def _contact_dist_grad_kernel(
   dD_dpos = wp.where(active_D, dD_dimp * dimp_dpos, 0.0)
 
   wp.atomic_add(contact_dist_grad_out, conid, adj_pos * dposout_dpos + adj_D * dD_dpos)
+
+
+@wp.kernel
+def _contact_dist_geom_pos_grad_kernel(
+  # Model:
+  geom_type: wp.array[int],
+  geom_size: wp.array2d[wp.vec3],
+  # Data in:
+  geom_xmat_in: wp.array2d[wp.mat33],
+  contact_geom_in: wp.array[wp.vec2i],
+  contact_worldid_in: wp.array[int],
+  contact_geomcollisionid_in: wp.array[int],
+  contact_type_in: wp.array[int],
+  nacon_in: wp.array[int],
+  contact_dist_grad_in: wp.array[float],
+  # Out:
+  geom_xpos_grad_out: wp.array2d[wp.vec3],
+  geom_xmat_grad_out: wp.array2d[wp.mat33],
+):
+  conid = wp.tid()
+  if conid >= nacon_in[0]:
+    return
+  if not (contact_type_in[conid] & 1):  # ContactType.CONSTRAINT
+    return
+
+  adj_dist = contact_dist_grad_in[conid]
+  if adj_dist == 0.0:
+    return
+
+  geom = contact_geom_in[conid]
+  g1 = geom[0]
+  g2 = geom[1]
+  if g1 < 0 or g2 < 0:
+    return
+
+  worldid = contact_worldid_in[conid]
+  t1 = geom_type[g1]
+  t2 = geom_type[g2]
+  size_id = worldid % geom_size.shape[0]
+  subcid = contact_geomcollisionid_in[conid]
+
+  if t1 == 0 and (t2 == 2 or t2 == 3):
+    plane_normal = wp.vec3(
+      geom_xmat_in[worldid, g1][0, 2],
+      geom_xmat_in[worldid, g1][1, 2],
+      geom_xmat_in[worldid, g1][2, 2],
+    )
+    wp.atomic_add(geom_xpos_grad_out, worldid, g1, -adj_dist * plane_normal)
+    wp.atomic_add(geom_xpos_grad_out, worldid, g2, adj_dist * plane_normal)
+    if t2 == 3:
+      half_length = geom_size[size_id, g2][1]
+      sign = wp.where(subcid == 0, 1.0, -1.0)
+      axis_grad = adj_dist * sign * half_length * plane_normal
+      wp.atomic_add(
+        geom_xmat_grad_out,
+        worldid,
+        g2,
+        wp.mat33(
+          0.0,
+          0.0,
+          axis_grad[0],
+          0.0,
+          0.0,
+          axis_grad[1],
+          0.0,
+          0.0,
+          axis_grad[2],
+        ),
+      )
+    return
+
+  if (t1 == 2 or t1 == 3) and t2 == 0:
+    plane_normal = wp.vec3(
+      geom_xmat_in[worldid, g2][0, 2],
+      geom_xmat_in[worldid, g2][1, 2],
+      geom_xmat_in[worldid, g2][2, 2],
+    )
+    wp.atomic_add(geom_xpos_grad_out, worldid, g1, adj_dist * plane_normal)
+    wp.atomic_add(geom_xpos_grad_out, worldid, g2, -adj_dist * plane_normal)
+    if t1 == 3:
+      half_length = geom_size[size_id, g1][1]
+      sign = wp.where(subcid == 0, 1.0, -1.0)
+      axis_grad = adj_dist * sign * half_length * plane_normal
+      wp.atomic_add(
+        geom_xmat_grad_out,
+        worldid,
+        g1,
+        wp.mat33(
+          0.0,
+          0.0,
+          axis_grad[0],
+          0.0,
+          0.0,
+          axis_grad[1],
+          0.0,
+          0.0,
+          axis_grad[2],
+        ),
+      )
 
 
 @wp.kernel
@@ -555,16 +674,16 @@ def _limit_efc_grad_kernel(
     return
 
   efc_type = efc_type_in[worldid, efcid]
-  is_limit = efc_type == types.ConstraintType.LIMIT_JOINT
-  is_contact = (
-    efc_type == types.ConstraintType.CONTACT_FRICTIONLESS
-    or efc_type == types.ConstraintType.CONTACT_PYRAMIDAL
-    or efc_type == types.ConstraintType.CONTACT_ELLIPTIC
-  )
+  is_limit = False
+  is_contact = False
+  if efc_type == 3:  # ConstraintType.LIMIT_JOINT
+    is_limit = True
+  elif efc_type == 5 or efc_type == 6 or efc_type == 7:  # contact rows
+    is_contact = True
   if not (is_limit or is_contact):
     return
 
-  if efc_state_in[worldid, efcid] != types.ConstraintState.QUADRATIC.value:
+  if efc_state_in[worldid, efcid] != 1:  # ConstraintState.QUADRATIC
     return
 
   # Equality/friction rows have different force laws.  This kernel handles
@@ -588,14 +707,14 @@ def _limit_efc_grad_kernel(
   Jaref = solver_Jaref_in[worldid, efcid]
   aref_grad = D * jv
   if is_contact:
-    efc_aref_contact_grad_out[worldid, efcid] += aref_grad
-    efc_D_grad_out[worldid, efcid] += -Jaref * jv
+    wp.atomic_add(efc_aref_contact_grad_out, worldid, efcid, aref_grad)
+    wp.atomic_add(efc_D_grad_out, worldid, efcid, -Jaref * jv)
   elif is_limit:
-    efc_aref_limit_grad_out[worldid, efcid] += aref_grad
-    efc_D_limit_grad_out[worldid, efcid] += -Jaref * jv
+    wp.atomic_add(efc_aref_limit_grad_out, worldid, efcid, aref_grad)
+    wp.atomic_add(efc_D_limit_grad_out, worldid, efcid, -Jaref * jv)
   else:
-    efc_aref_auto_grad_out[worldid, efcid] += aref_grad
-    efc_D_grad_out[worldid, efcid] += -Jaref * jv
+    wp.atomic_add(efc_aref_auto_grad_out, worldid, efcid, aref_grad)
+    wp.atomic_add(efc_D_grad_out, worldid, efcid, -Jaref * jv)
 
 
 @wp.kernel
@@ -1430,6 +1549,8 @@ def solver_implicit_adjoint(
   qpos_ref=None,
   qvel_ref=None,
   M_ref=None,
+  qLD_ref=None,
+  qLDiagInv_ref=None,
   cdof_ref=None,
   crb_ref=None,
   cinert_ref=None,
@@ -1512,7 +1633,7 @@ def solver_implicit_adjoint(
       inputs=[adj_qacc],
       outputs=[qacc_smooth_grad],
     )
-    _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, adj_qacc)
+    _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, adj_qacc, qLD_ref, qLDiagInv_ref)
     return
 
   if m.opt.solver != types.SolverType.NEWTON:
@@ -1524,7 +1645,18 @@ def solver_implicit_adjoint(
       inputs=[adj_qacc],
       outputs=[qacc_smooth_grad],
     )
-    _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, adj_qacc)
+    _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, adj_qacc, qLD_ref, qLDiagInv_ref)
+    return
+
+  if os.environ.get("MJW_SOLVER_ADJOINT_IDENTITY") == "1":
+    qacc_smooth_grad = _ensure_array_grad(qacc_smooth_ref)
+    wp.launch(
+      _accumulate_grad_kernel,
+      dim=(d.nworld, nv),
+      inputs=[adj_qacc],
+      outputs=[qacc_smooth_grad],
+    )
+    _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, adj_qacc, qLD_ref, qLDiagInv_ref)
     return
 
   # Solve H * v = adj_qacc
@@ -1533,7 +1665,7 @@ def solver_implicit_adjoint(
 
   # adj_qacc_smooth += M * v  (accumulate, not overwrite)
   tmp = wp.zeros((d.nworld, m.nv_pad), dtype=float)
-  support.mul_m(m, d, tmp, v)
+  support.mul_m(m, d, tmp, v, M=M_ref)
   qacc_smooth_grad = _ensure_array_grad(qacc_smooth_ref)
   wp.launch(
     _accumulate_grad_kernel,
@@ -1541,7 +1673,7 @@ def solver_implicit_adjoint(
     inputs=[tmp],
     outputs=[qacc_smooth_grad],
   )
-  _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, tmp)
+  _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, tmp, qLD_ref, qLDiagInv_ref)
   _accumulate_solver_mass_correction_vjp(
     m,
     d,
@@ -1629,6 +1761,18 @@ def _efc_level_gradients(m: types.Model, d: types.Data, v, qacc, qpos_ref=None, 
         ],
         outputs=[contact_aref_grad, limit_aref_grad, auto_aref_grad_out, limit_D_grad, D_grad_out],
       )
+      if os.environ.get("MJW_DEBUG_ADJOINT", "0") == "3":
+        import numpy as np
+
+        contact_aref_np = contact_aref_grad.numpy()
+        D_grad_np = D_grad_out.numpy()
+        print(
+          "[adjoint:efc_manual] "
+          f"|contact_aref|={np.linalg.norm(contact_aref_np):.6e} "
+          f"|D_grad|={np.linalg.norm(D_grad_np):.6e} "
+          f"contact_aref0={contact_aref_np[0, :min(8, contact_aref_np.shape[1])]} "
+          f"D0={D_grad_np[0, :min(8, D_grad_np.shape[1])]}"
+        )
 
     efc_aref = d.efc.aref
     efc_pos = d.efc.pos
@@ -1688,6 +1832,36 @@ def _efc_level_gradients(m: types.Model, d: types.Data, v, qacc, qpos_ref=None, 
           ],
           outputs=[contact_dist_grad],
         )
+        geom_xpos_grad = _ensure_grad(d.geom_xpos)
+        geom_xmat_grad = _ensure_grad(d.geom_xmat)
+        wp.launch(
+          _contact_dist_geom_pos_grad_kernel,
+          dim=d.naconmax,
+          inputs=[
+            m.geom_type,
+            m.geom_size,
+            d.geom_xmat,
+            d.contact.geom,
+            d.contact.worldid,
+            d.contact.geomcollisionid,
+            d.contact.type,
+            d.nacon,
+            contact_dist_grad,
+          ],
+          outputs=[geom_xpos_grad, geom_xmat_grad],
+        )
+        if os.environ.get("MJW_DEBUG_ADJOINT", "0") == "3":
+          import numpy as np
+
+          efc_pos_np = efc_pos_grad.numpy()
+          contact_dist_np = contact_dist_grad.numpy()
+          print(
+            "[adjoint:contact_dist] "
+            f"|efc_pos_grad|={np.linalg.norm(efc_pos_np):.6e} "
+            f"|contact_dist_grad|={np.linalg.norm(contact_dist_np):.6e} "
+            f"efc_pos0={efc_pos_np[0, :min(8, efc_pos_np.shape[1])]} "
+            f"contact_dist0={contact_dist_np[:min(8, contact_dist_np.shape[0])]}"
+          )
 
     if os.environ.get("MJW_DISABLE_EFC_POS_VJP") != "1" and "limit_aref_grad" in locals() and limit_aref_grad is not None:
       qpos_grad = _ensure_grad(qpos_ref)
@@ -1758,7 +1932,7 @@ def _efc_level_gradients(m: types.Model, d: types.Data, v, qacc, qpos_ref=None, 
     # contact-J geometry VJP below is useful for debugging isolated terms, but
     # double-counts the generated backward path in normal AD rollouts.
     if (
-      os.environ.get("MJW_ENABLE_MANUAL_CONTACT_J_VJP") == "1"
+      os.environ.get("MJW_ENABLE_MANUAL_CONTACT_J_VJP", "1") != "0"
       and os.environ.get("MJW_DISABLE_CONTACT_J_VJP") != "1"
       and hasattr(d.efc.J, "grad")
       and d.efc.J.grad is not None
@@ -1831,6 +2005,8 @@ def solver_smooth_adjoint(
   qpos_ref=None,
   qvel_ref=None,
   M_ref=None,
+  qLD_ref=None,
+  qLDiagInv_ref=None,
   cdof_ref=None,
   crb_ref=None,
   cinert_ref=None,
@@ -1888,7 +2064,7 @@ def solver_smooth_adjoint(
       inputs=[adj_qacc],
       outputs=[qacc_smooth_grad],
     )
-    _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, adj_qacc)
+    _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, adj_qacc, qLD_ref, qLDiagInv_ref)
     return
 
   if m.opt.solver != types.SolverType.NEWTON:
@@ -1899,7 +2075,7 @@ def solver_smooth_adjoint(
       inputs=[adj_qacc],
       outputs=[qacc_smooth_grad],
     )
-    _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, adj_qacc)
+    _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, adj_qacc, qLD_ref, qLDiagInv_ref)
     return
 
   # Read smooth adjoint parameters from Data
@@ -2087,7 +2263,7 @@ def solver_smooth_adjoint(
 
   # adj_qacc_smooth += M * v
   tmp = wp.zeros((d.nworld, m.nv_pad), dtype=float)
-  support.mul_m(m, d, tmp, v)
+  support.mul_m(m, d, tmp, v, M=M_ref)
   qacc_smooth_grad = _ensure_array_grad(qacc_smooth_ref)
   wp.launch(
     _accumulate_grad_kernel,
@@ -2095,7 +2271,7 @@ def solver_smooth_adjoint(
     inputs=[tmp],
     outputs=[qacc_smooth_grad],
   )
-  _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, tmp)
+  _accumulate_qfrc_smooth_vjp(m, d, qfrc_smooth_ref, tmp, qLD_ref, qLDiagInv_ref)
   _accumulate_solver_mass_correction_vjp(
     m,
     d,

@@ -407,6 +407,18 @@ def _smooth_recompute_kernel(
     contact_frame_out[cid] = frame
     handled = True
 
+  # sphere-plane
+  if not handled and t1 == 2 and t2 == 0:
+    plane_normal = wp.vec3(mat2[0, 2], mat2[1, 2], mat2[2, 2])
+    dist, pos = smooth_plane_sphere(plane_normal, pos2, pos1, size1[0])
+    # Contact Jacobians use body2 - body1.  When the dynamic geom is body1
+    # and the plane is body2, flip the normal so J*qvel matches d(dist)/dt.
+    frame = smooth_make_frame(-plane_normal)
+    contact_dist_out[cid] = dist
+    contact_pos_out[cid] = pos
+    contact_frame_out[cid] = frame
+    handled = True
+
   # sphere-sphere
   if not handled and t1 == 2 and t2 == 2:
     dist, pos, normal = smooth_sphere_sphere(pos1, size1[0], pos2, size2[0])
@@ -465,6 +477,20 @@ def _smooth_recompute_kernel(
       contact_dist_out[cid] = dists[1]
       contact_pos_out[cid] = wp.vec3(positions[1, 0], positions[1, 1], positions[1, 2])
     contact_frame_out[cid] = frame
+    handled = True
+
+  # capsule-plane (2 contacts via geomcollisionid)
+  if not handled and t1 == 3 and t2 == 0:
+    plane_normal = wp.vec3(mat2[0, 2], mat2[1, 2], mat2[2, 2])
+    cap_axis = wp.vec3(mat1[0, 2], mat1[1, 2], mat1[2, 2])
+    dists, positions, _ = smooth_plane_capsule(plane_normal, pos2, pos1, cap_axis, size1[0], size1[1])
+    if subcid == 0:
+      contact_dist_out[cid] = dists[0]
+      contact_pos_out[cid] = wp.vec3(positions[0, 0], positions[0, 1], positions[0, 2])
+    else:
+      contact_dist_out[cid] = dists[1]
+      contact_pos_out[cid] = wp.vec3(positions[1, 0], positions[1, 1], positions[1, 2])
+    contact_frame_out[cid] = smooth_make_frame(-plane_normal)
     handled = True
 
   # Unsupported types: no-op (keeps discrete values, zero gradient)
@@ -839,4 +865,5 @@ def smooth_contact_to_efc(m: types.Model, d: types.Data):
       d.efc.vel,
       d.efc.aref,
     ],
+    record_tape=False,
   )
