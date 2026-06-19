@@ -1753,7 +1753,16 @@ def _efc_level_gradients(m: types.Model, d: types.Data, v, qacc, qpos_ref=None, 
         outputs=[qvel_grad, d.efc.J.grad],
       )
 
-    if os.environ.get("MJW_DISABLE_CONTACT_J_VJP") != "1" and hasattr(d.efc.J, "grad") and d.efc.J.grad is not None:
+    # smooth_contact_to_efc is recorded on the tape with backward enabled and
+    # already propagates d.efc.J.grad to contact.pos/frame/cdof.  The manual
+    # contact-J geometry VJP below is useful for debugging isolated terms, but
+    # double-counts the generated backward path in normal AD rollouts.
+    if (
+      os.environ.get("MJW_ENABLE_MANUAL_CONTACT_J_VJP") == "1"
+      and os.environ.get("MJW_DISABLE_CONTACT_J_VJP") != "1"
+      and hasattr(d.efc.J, "grad")
+      and d.efc.J.grad is not None
+    ):
       contact_pos_grad = _ensure_grad(d.contact.pos)
       contact_frame_grad = _ensure_grad(d.contact.frame)
       wp.launch(
